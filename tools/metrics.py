@@ -4,6 +4,9 @@
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr

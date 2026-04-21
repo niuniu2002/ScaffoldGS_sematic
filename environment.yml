@@ -19,5 +19,6 @@ dependencies:
     - wandb
     - lpips
     - laspy
+    - opencv-python-headless==4.6.0.66
     - submodules/diff-gaussian-rasterization
     - submodules/simple-knn

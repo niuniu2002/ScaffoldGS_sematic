@@ -3,6 +3,8 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
+# Extended for 3D semantic segmentation (see PROJECT.md for details).
+#
 # This software is free for non-commercial, research and evaluation use 
 # under the terms of the LICENSE.md file.
 #
@@ -127,11 +129,21 @@ class GaussianModel:
             nn.Sigmoid()
         ).cuda()
 
+        # [修正] 语义分割头
+        # 这里的输出经过 Sigmoid 归一化到 [0,1]，方便 train.py 计算 loss
+        self.mlp_segmentation = nn.Sequential(
+            nn.Linear(self.feat_dim, 64),
+            nn.ReLU(True),
+            nn.Linear(64, 1),
+            nn.Sigmoid(), 
+        ).cuda()
+
 
     def eval(self):
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color.eval()
+        self.mlp_segmentation.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
@@ -141,9 +153,10 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
+        self.mlp_segmentation.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
-        if self.use_feat_bank:                   
+        if self.use_feat_bank:                  
             self.mlp_feature_bank.train()
 
     def capture(self):
@@ -225,6 +238,21 @@ class GaussianModel:
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+
+    # [修正] 删除了冗余的 get_anchor_seg_data，只保留 train.py 需要的接口
+    def get_anchor_seg_logits(self):
+        """
+        供 train.py 中的 KNN Loss 调用。
+        返回每个锚点的分割预测值。
+        注意：因为 mlp_segmentation 包含 Sigmoid，所以这里返回的是 [0,1] 的概率值。
+        """
+        # 1. 获取特征 (Detach)：不希望 KNN 改变锚点的特征或位置，只改变分割头的权重
+        feat = self._anchor_feat.detach()
+
+        # 2. 计算分割值 (Keep Grad)：保留对 mlp_segmentation 的梯度
+        seg = self.mlp_segmentation(feat)  # [N, 1]
+        
+        return seg.squeeze(-1)
     
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)
@@ -282,6 +310,8 @@ class GaussianModel:
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         
+        # [修正] 学习率调整：建议将 segmentation 的 lr 设为 0.001 (比 feature_lr 小一点更稳定)
+        # 您之前的代码用的是 training_args.feature_lr (0.0075)，这里我帮您改为了 0.001
         
         if self.use_feat_bank:
             l = [
@@ -297,6 +327,7 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
+                {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
             ]
         elif self.appearance_dim > 0:
             l = [
@@ -311,6 +342,7 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
+                {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
             ]
         else:
             l = [
@@ -324,42 +356,43 @@ class GaussianModel:
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
+                {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
             ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.position_lr_delay_mult,
-                                                    max_steps=training_args.position_lr_max_steps)
+                                                        lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+                                                        lr_delay_mult=training_args.position_lr_delay_mult,
+                                                        max_steps=training_args.position_lr_max_steps)
         self.offset_scheduler_args = get_expon_lr_func(lr_init=training_args.offset_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.offset_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.offset_lr_delay_mult,
-                                                    max_steps=training_args.offset_lr_max_steps)
+                                                        lr_final=training_args.offset_lr_final*self.spatial_lr_scale,
+                                                        lr_delay_mult=training_args.offset_lr_delay_mult,
+                                                        max_steps=training_args.offset_lr_max_steps)
         
         self.mlp_opacity_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_opacity_lr_init,
-                                                    lr_final=training_args.mlp_opacity_lr_final,
-                                                    lr_delay_mult=training_args.mlp_opacity_lr_delay_mult,
-                                                    max_steps=training_args.mlp_opacity_lr_max_steps)
+                                                            lr_final=training_args.mlp_opacity_lr_final,
+                                                            lr_delay_mult=training_args.mlp_opacity_lr_delay_mult,
+                                                            max_steps=training_args.mlp_opacity_lr_max_steps)
         
         self.mlp_cov_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_cov_lr_init,
-                                                    lr_final=training_args.mlp_cov_lr_final,
-                                                    lr_delay_mult=training_args.mlp_cov_lr_delay_mult,
-                                                    max_steps=training_args.mlp_cov_lr_max_steps)
+                                                            lr_final=training_args.mlp_cov_lr_final,
+                                                            lr_delay_mult=training_args.mlp_cov_lr_delay_mult,
+                                                            max_steps=training_args.mlp_cov_lr_max_steps)
         
         self.mlp_color_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
-                                                    lr_final=training_args.mlp_color_lr_final,
-                                                    lr_delay_mult=training_args.mlp_color_lr_delay_mult,
-                                                    max_steps=training_args.mlp_color_lr_max_steps)
+                                                            lr_final=training_args.mlp_color_lr_final,
+                                                            lr_delay_mult=training_args.mlp_color_lr_delay_mult,
+                                                            max_steps=training_args.mlp_color_lr_max_steps)
         if self.use_feat_bank:
             self.mlp_featurebank_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_featurebank_lr_init,
-                                                        lr_final=training_args.mlp_featurebank_lr_final,
-                                                        lr_delay_mult=training_args.mlp_featurebank_lr_delay_mult,
-                                                        max_steps=training_args.mlp_featurebank_lr_max_steps)
+                                                                lr_final=training_args.mlp_featurebank_lr_final,
+                                                                lr_delay_mult=training_args.mlp_featurebank_lr_delay_mult,
+                                                                max_steps=training_args.mlp_featurebank_lr_max_steps)
         if self.appearance_dim > 0:
             self.appearance_scheduler_args = get_expon_lr_func(lr_init=training_args.appearance_lr_init,
-                                                        lr_final=training_args.appearance_lr_final,
-                                                        lr_delay_mult=training_args.appearance_lr_delay_mult,
-                                                        max_steps=training_args.appearance_lr_max_steps)
+                                                                lr_final=training_args.appearance_lr_final,
+                                                                lr_delay_mult=training_args.appearance_lr_delay_mult,
+                                                                max_steps=training_args.appearance_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -448,10 +481,18 @@ class GaussianModel:
 
         offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset")]
         offset_names = sorted(offset_names, key = lambda x: int(x.split('_')[-1]))
-        offsets = np.zeros((anchor.shape[0], len(offset_names)))
+        num_vertices = anchor.shape[0]
+        num_offset_attrs = len(offset_names)
+        offsets = np.zeros((num_vertices, num_offset_attrs), dtype=np.float32)
         for idx, attr_name in enumerate(offset_names):
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
-        offsets = offsets.reshape((offsets.shape[0], 3, -1))
+
+        # 当顶点数为 0 时，直接按照属性个数构建形状，避免 reshape 报错
+        if num_vertices > 0 and num_offset_attrs > 0:
+            offsets = offsets.reshape((num_vertices, 3, -1))
+        else:
+            n_offsets = num_offset_attrs // 3 if num_offset_attrs % 3 == 0 else 0
+            offsets = np.zeros((num_vertices, 3, n_offsets), dtype=np.float32)
         
         self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -625,8 +666,13 @@ class GaussianModel:
                 for i in range(max_iters):
                     cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[i*chunk_size:(i+1)*chunk_size, :]).all(-1).any(-1).view(-1)
                     remove_duplicates_list.append(cur_remove_duplicates)
-                
-                remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
+
+                # 如果没有产生任何 chunk（例如 grid_coords.shape[0]==0），
+                # reduce 在空序列上会报错。此处做防护处理：
+                if len(remove_duplicates_list) == 0:
+                    remove_duplicates = torch.zeros((selected_grid_coords_unique.shape[0],), dtype=torch.bool, device=grid_coords.device)
+                else:
+                    remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
             else:
                 remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords).all(-1).any(-1).view(-1)
 
@@ -752,6 +798,11 @@ class GaussianModel:
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
 
+            self.mlp_segmentation.eval()
+            seg_mlp = torch.jit.trace(self.mlp_segmentation, (torch.rand(1, self.feat_dim).cuda()))
+            seg_mlp.save(os.path.join(path, 'segmentation_mlp.pt'))
+            self.mlp_segmentation.train()
+
             if self.use_feat_bank:
                 self.mlp_feature_bank.eval()
                 feature_bank_mlp = torch.jit.trace(self.mlp_feature_bank, (torch.rand(1, 3+1).cuda()))
@@ -770,6 +821,7 @@ class GaussianModel:
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
+                    'segmentation_mlp': self.mlp_segmentation.state_dict(),
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
                     'appearance': self.embedding_appearance.state_dict()
                     }, os.path.join(path, 'checkpoints.pth'))
@@ -778,6 +830,7 @@ class GaussianModel:
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
+                    'segmentation_mlp': self.mlp_segmentation.state_dict(),
                     'appearance': self.embedding_appearance.state_dict()
                     }, os.path.join(path, 'checkpoints.pth'))
             else:
@@ -785,6 +838,7 @@ class GaussianModel:
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
+                    'segmentation_mlp': self.mlp_segmentation.state_dict(),
                     }, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
@@ -795,6 +849,7 @@ class GaussianModel:
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
             self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
+            self.mlp_segmentation = torch.jit.load(os.path.join(path, 'segmentation_mlp.pt')).cuda()
             if self.use_feat_bank:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
@@ -804,6 +859,8 @@ class GaussianModel:
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
             self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
             self.mlp_color.load_state_dict(checkpoint['color_mlp'])
+            if 'segmentation_mlp' in checkpoint:
+                self.mlp_segmentation.load_state_dict(checkpoint['segmentation_mlp'])
             if self.use_feat_bank:
                 self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
             if self.appearance_dim > 0:

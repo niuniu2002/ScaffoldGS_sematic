@@ -3,6 +3,8 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
+# Extended for 3D semantic segmentation (see PROJECT.md for details).
+#
 # This software is free for non-commercial, research and evaluation use 
 # under the terms of the LICENSE.md file.
 #
@@ -30,7 +32,12 @@ class ParamGroup:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
                 else:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
+                    # Compatibility: allow `--r` as an alias for `--resolution`.
+                    # The original code already supports `--resolution` and `-r`.
+                    if key == "resolution":
+                        group.add_argument("--" + key, ("-" + key[0:1]), ("--" + key[0:1]), default=value, type=t)
+                    else:
+                        group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
@@ -141,6 +148,43 @@ class OptimizationParams(ParamGroup):
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+
+        # --- Scaling regularization (optional) ---
+        # Weight decays exponentially from scaling_reg_start -> scaling_reg_end over the full training.
+        # Helps preserve thin structures (stems/leaves) while keeping early stability.
+        # Default keeps training scale stable (no decay) while using a weaker baseline.
+        self.scaling_reg_start = 0.001
+        self.scaling_reg_end = 0.001
+
+        # --- Segmentation / regularization weights (optional) ---
+        # Hard semantic warmup: before this iteration, skip Mask/KNN losses entirely.
+        self.start_semantic_iter = 7000
+
+        # Mask supervision weight (BCE on rendered mask vs semantic_mask)
+        self.mask_weight = 0.01
+        # Linearly ramp mask_weight from 0 -> mask_weight
+        self.mask_warmup = 0          # iterations to keep mask weight at 0
+        self.mask_ramp = 0            # iterations to linearly ramp to full weight
+
+        # KNN consistency (smooth segmentation logits on anchors)
+        self.knn_weight = 0.05
+        # Compute KNN loss every N iterations; set <=0 to disable
+        self.knn_every = 100
+        # Offset for scheduling within the period (keeps old default behavior)
+        self.knn_offset = 55
+        # Linearly ramp knn_weight from 0 -> knn_weight
+        self.knn_warmup = 0
+        self.knn_ramp = 0
+
+        # --- Focal loss / uncertainty-aware weighting (optional) ---
+        # Focal loss alpha (class imbalance)
+        self.focal_alpha = 0.25
+        # Focal loss gamma (hard example mining)
+        self.focal_gamma = 2.0
+        # Minimum pixel weight for uncertain pseudo-labels
+        self.uncertainty_min = 0.1
+        # Shape of the confidence-to-weight mapping; >1 further downweights uncertain (edge) pixels.
+        self.uncertainty_power = 2.0
         
         # for anchor densification
         self.start_stat = 500

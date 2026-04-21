@@ -169,8 +169,8 @@ which may differ somewhat from the original 3D-GS, but it does not affect the an
 Meanwhile, we keep the manual rendering function with a similar usage of the counterpart in [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting), one can run it by 
 
 ```
-python render.py -m <path to trained model> # Generate renderings
-python metrics.py -m <path to trained model> # Compute error metrics on renderings
+python tools/render.py -m <path to trained model> # Generate renderings
+python tools/metrics.py -m <path to trained model> # Compute error metrics on renderings
 ```
 
 ## Viewer

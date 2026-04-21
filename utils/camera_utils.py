@@ -13,6 +13,8 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+import torch
+import torch.nn.functional as F
 
 WARNED = False
 
@@ -47,10 +49,21 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+    # 语义 mask：从 CameraInfo 中读取，并缩放到当前分辨率
+    semantic_mask = getattr(cam_info, "semantic_mask", None)
+    if semantic_mask is not None:
+        # semantic_mask: [1, H_orig, W_orig] -> 按当前分辨率缩放
+        # F.interpolate 需要 [N, C, H, W]
+        sm = semantic_mask.unsqueeze(0)  # [1, 1, H, W]
+        sm = F.interpolate(sm, size=(resolution[1], resolution[0]), mode="nearest")
+        semantic_mask = sm.squeeze(0)    # 回到 [1, H_res, W_res]
+
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id,
+                  data_device=args.data_device,
+                  semantic_mask=semantic_mask)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

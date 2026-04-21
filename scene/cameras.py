@@ -9,15 +9,21 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+from typing import Optional
+
 import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0,
+                 data_device: str = "cuda",
+                 semantic_mask: Optional[torch.Tensor] = None,  # 新增参数：语义 mask Tensor
                  ):
         super(Camera, self).__init__()
 
@@ -44,6 +50,12 @@ class Camera(nn.Module):
             self.original_image *= gt_alpha_mask.to(self.data_device)
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+
+        # 保存 2D 语义 mask（已在 dataset_readers 中读成 Tensor）
+        self.semantic_mask = None
+        if semantic_mask is not None:
+            # semantic_mask: [1, H, W]，这里仅负责搬运到对应设备
+            self.semantic_mask = semantic_mask.to(self.data_device)
 
         self.zfar = 100.0
         self.znear = 0.01

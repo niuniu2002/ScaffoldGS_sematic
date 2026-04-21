@@ -3,6 +3,8 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
+# Extended for 3D semantic segmentation (see PROJECT.md for details).
+#
 # This software is free for non-commercial, research and evaluation use 
 # under the terms of the LICENSE.md file.
 #
@@ -10,7 +12,6 @@
 #
 import torch
 from einops import repeat
-
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
@@ -45,12 +46,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             feat[:,::1, :1]*bank_weight[:,:,2:]
         feat = feat.squeeze(dim=-1) # [n, c]
 
+    # per-anchor segmentation confidence
+    # Detach to avoid segmentation supervision pulling shared features (which can hurt RGB reconstruction).
+    segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, 1]
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
     if pc.appearance_dim > 0:
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
-        # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
         appearance = pc.get_appearance(camera_indicies)
 
     # get offset's opacity
@@ -89,49 +92,44 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     
     # offsets
     offsets = grid_offsets.view([-1, 3]) # [mask]
-    
+
+    # expand per-anchor segmentation to per-Gaussian
+    segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)  # [N*k, 1]
+
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
+    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, segmentation_all], dim=-1)
     masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+    scaling_repeat, repeat_anchor, color, scale_rot, offsets, segmentation = masked.split([6, 3, 3, 7, 3, 1], dim=-1)
     
     # post-process cov
-    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
+    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) 
     rot = pc.rotation_activation(scale_rot[:,3:7])
     
-    # post-process offsets to get centers for gaussians
+    # post-process offsets
     offsets = offsets * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets
 
-    if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask
-    else:
-        return xyz, color, opacity, scaling, rot
+    # [修改点1] 无论是否训练，始终返回所有数据（包括 segmentation）
+    return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
     """
     Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
     """
     is_training = pc.get_color_mlp.training
         
-    if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    else:
-        xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    
+    # [修改点2] 始终接收完整返回值
+    xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
 
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    # Create zero tensor.
     screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
     if retain_grad:
         try:
             screenspace_points.retain_grad()
         except:
             pass
-
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -154,7 +152,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # Rasterize visible Gaussians to image
     rendered_image, radii = rasterizer(
         means3D = xyz,
         means2D = screenspace_points,
@@ -164,39 +162,61 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scaling,
         rotations = rot,
         cov3D_precomp = None)
-    
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    if is_training:
-        return {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                "selection_mask": mask,
-                "neural_opacity": neural_opacity,
-                "scaling": scaling,
-                }
-    else:
-        return {"render": rendered_image,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                }
 
+    # [修改点3] 强制执行语义掩码光栅化 (移除 if is_training 判断)
+    # NOTE: Mask pass uses a black background so pixels with no Gaussian coverage
+    # render to 0 (matches typical GT masks), independent of dataset white_background.
+    raster_settings_mask = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=torch.zeros_like(bg_color),
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=1,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+    )
+    rasterizer_mask = GaussianRasterizer(raster_settings=raster_settings_mask)
+
+    # segmentation: [N_visible_gaussians, 1] -> fake 3-channel features for rasterizer
+    seg_features = segmentation.repeat(1, 3)
+    rendered_mask_3ch, _ = rasterizer_mask(
+        means3D = xyz,
+        means2D = screenspace_points,
+        shs = None,
+        colors_precomp = seg_features,
+        opacities = opacity,
+        scales = scaling,
+        rotations = rot,
+        cov3D_precomp = None,
+    )
+    # all 3 channels are identical; keep a single-channel tensor [1, H, W]
+    rendered_mask = rendered_mask_3ch[0:1, :, :]
+    
+    # [修改点4] 始终返回包含 mask 的完整字典
+    return {"render": rendered_image,
+            "mask": rendered_mask,  # 现在这里肯定有值了！
+            "viewspace_points": screenspace_points,
+            "visibility_filter" : radii > 0,
+            "radii": radii,
+            "selection_mask": mask,
+            "neural_opacity": neural_opacity,
+            "scaling": scaling,
+            "segmentation": segmentation,
+            }
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    # ... (这部分保持原样即可)
     screenspace_points = torch.zeros_like(pc.get_anchor, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
         pass
 
-    # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
@@ -216,12 +236,7 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
     means3D = pc.get_anchor
-
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
     scales = None
     rotations = None
     cov3D_precomp = None
