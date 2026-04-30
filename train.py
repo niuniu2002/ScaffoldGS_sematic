@@ -43,6 +43,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.gaussian_model import SegmentationHead
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -136,14 +137,53 @@ def saveRuntimeCode(dst: str) -> None:
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, load_iteration=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
+                              use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False))
     # 如果提供了 load_iteration，则从对应的 point_cloud/iteration_X 加载已有高斯作为初始化
     scene = Scene(dataset, gaussians, load_iteration=load_iteration, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # [Two-Stage] 如果只训练 segmentation，冻结所有参数并替换 optimizer
+    if getattr(opt, 'seg_only', False):
+        logger.info("\n[Two-Stage Mode] Replacing seg head with deep MLP and freezing all other parameters.")
+        # 重新初始化更深的分割头（替换从 checkpoint 加载的浅 MLP）
+        seg_outputs = gaussians.n_offsets if gaussians.use_per_gaussian_seg else 1
+        gaussians.mlp_segmentation = SegmentationHead(
+            feat_dim=gaussians.feat_dim,
+            hidden_dim=128,
+            num_layers=3,
+            dropout=0.0,
+            num_outputs=seg_outputs,
+        ).cuda()
+        # Freeze all explicit parameters
+        for attr in ('_anchor', '_offset', '_anchor_feat', '_scaling', '_rotation', '_opacity'):
+            p = getattr(gaussians, attr, None)
+            if p is not None and hasattr(p, 'requires_grad'):
+                p.requires_grad = False
+        # Freeze all MLPs except the new seg head
+        for mlp in (gaussians.mlp_opacity, gaussians.mlp_cov, gaussians.mlp_color):
+            for p in mlp.parameters():
+                p.requires_grad = False
+        if gaussians.use_feat_bank:
+            for p in gaussians.mlp_feature_bank.parameters():
+                p.requires_grad = False
+        if gaussians.appearance_dim > 0 and gaussians.embedding_appearance is not None:
+            for p in gaussians.embedding_appearance.parameters():
+                p.requires_grad = False
+        # New seg head remains trainable (default requires_grad=True)
+        for param in gaussians.mlp_segmentation.parameters():
+            param.requires_grad = True
+        # 替换为只包含 segmentation 的 optimizer
+        gaussians.optimizer = torch.optim.Adam(
+            gaussians.mlp_segmentation.parameters(),
+            lr=0.001,
+            eps=1e-15
+        )
+        logger.info(f"  Optimizable params: {sum(p.numel() for p in gaussians.mlp_segmentation.parameters())}")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -283,10 +323,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             try:
                 # 获取锚点数据 (保持在 CUDA)
                 anchor_xyz = gaussians.get_anchor.detach()
-                anchor_seg = gaussians.get_anchor_seg_logits()
+                # [改进] 使用 logit-space 的 segmentation 值，避免概率空间 MSE 推向 0.5
+                anchor_seg_logit = gaussians.get_anchor_seg_logits_raw()
 
                 # 长度一致性检查 (防止剪枝后显存未同步)
-                if anchor_xyz.shape[0] != anchor_seg.shape[0]:
+                if anchor_xyz.shape[0] != anchor_seg_logit.shape[0]:
                     pass
                 else:
                     N = anchor_xyz.shape[0]
@@ -299,8 +340,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         anchor_xyz_safe = anchor_xyz.detach().clone().contiguous()
                         sample_xyz = anchor_xyz_safe[indices].contiguous()
 
-                        # anchor_seg 保留梯度，用于更新 mlp_segmentation
-                        sample_seg = anchor_seg[indices].contiguous()
+                        # anchor_seg_logit 保留梯度，用于更新 mlp_segmentation
+                        sample_logit = anchor_seg_logit[indices].contiguous()
 
                         # 分块计算距离以降低峰值显存占用
                         chunk_size = 512
@@ -325,10 +366,21 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
                             if k > 1:
                                 neighbor_inds = topk_inds[:, 1:]
-                                neighbor_seg = anchor_seg[neighbor_inds]
+                                neighbor_logit = anchor_seg_logit[neighbor_inds]
 
-                                # 计算 Loss (MSE)
-                                loss_knn = torch.mean((sample_seg.unsqueeze(1) - neighbor_seg) ** 2)
+                                # [改进 v2] 概率空间对称 BCE KNN：
+                                # 数值范围可控，不会推向 0.5，而是强制相邻 anchor 趋向一致（都 0 或都 1）
+                                sample_prob = torch.sigmoid(sample_logit).unsqueeze(1)      # [n_samples, 1]
+                                neighbor_prob = torch.sigmoid(neighbor_logit)               # [n_samples, k-1]
+                                eps = 1e-6
+                                # 对称 BCE = [BCE(p_i||p_j) + BCE(p_j||p_i)] / 2
+                                loss_knn = -0.5 * (
+                                    sample_prob * torch.log(neighbor_prob + eps)
+                                    + (1.0 - sample_prob) * torch.log(1.0 - neighbor_prob + eps)
+                                    + neighbor_prob * torch.log(sample_prob + eps)
+                                    + (1.0 - neighbor_prob) * torch.log(1.0 - sample_prob + eps)
+                                )
+                                loss_knn = loss_knn.mean()
 
                                 knn_w = float(getattr(opt, "knn_weight", 0.0)) * _ramp_factor(
                                     semantic_phase_iter,
@@ -338,7 +390,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 if knn_w > 0:
                                     loss = loss + knn_w * loss_knn
 
-                                print(f"Iter {iteration}: KNN Loss = {loss_knn.item():.6f} (w={knn_w:.4f}, every={knn_every}, offset={knn_offset})")
+                                print(f"Iter {iteration}: KNN(BCE) Loss = {loss_knn.item():.6f} (w={knn_w:.4f}, every={knn_every}, offset={knn_offset})")
 
                             # 及时清理中间变量并释放显存
                             del dists, topk_inds, topk_val, dists_chunks
@@ -399,7 +451,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 scene.save(iteration)
             
             # densification
-            if iteration < opt.update_until and iteration > opt.start_stat:
+            if not getattr(opt, 'seg_only', False) and iteration < opt.update_until and iteration > opt.start_stat:
                 # add statis
                 gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
                 
@@ -579,8 +631,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
+                              use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False))
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 

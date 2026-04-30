@@ -94,7 +94,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = grid_offsets.view([-1, 3]) # [mask]
 
     # expand per-anchor segmentation to per-Gaussian
-    segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)  # [N*k, 1]
+    if pc.use_per_gaussian_seg:
+        segmentation_all = segmentation_anchor.view(-1, 1)  # [N*k, 1]
+    else:
+        segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)  # [N*k, 1]
 
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
@@ -184,12 +187,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # segmentation: [N_visible_gaussians, 1] -> fake 3-channel features for rasterizer
     seg_features = segmentation.repeat(1, 3)
+    # [关键改进 v4] 只 detach opacity：
+    # 切断 mask loss → opacity → mlp_opacity → feat → RGB 的主要冲突路径。
+    # 保留 xyz/scaling/rotation 的梯度，让 mask 仍可通过调整位置/大小来对齐 GT。
     rendered_mask_3ch, _ = rasterizer_mask(
         means3D = xyz,
         means2D = screenspace_points,
         shs = None,
         colors_precomp = seg_features,
-        opacities = opacity,
+        opacities = opacity.detach(),
         scales = scaling,
         rotations = rot,
         cov3D_precomp = None,

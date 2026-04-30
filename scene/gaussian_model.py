@@ -25,7 +25,35 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 
-    
+
+class SegmentationHead(nn.Module):
+    """更深的分割头，带残差连接和 LayerNorm。"""
+    def __init__(self, feat_dim=32, hidden_dim=128, num_layers=3, dropout=0.0, num_outputs=1):
+        super().__init__()
+        self.input_proj = nn.Linear(feat_dim, hidden_dim)
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.layers.append(nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            ))
+        self.logit_head = nn.Linear(hidden_dim, num_outputs)
+
+    def forward(self, x, return_logit=False):
+        feat = self.input_proj(x)
+        feat = self.input_norm(feat)
+        feat = torch.relu(feat)
+        for layer in self.layers:
+            feat = feat + layer(feat)
+        logit = self.logit_head(feat)
+        if return_logit:
+            return logit
+        return torch.sigmoid(logit)
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -46,11 +74,11 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, 
-                 feat_dim: int=32, 
-                 n_offsets: int=5, 
+    def __init__(self,
+                 feat_dim: int=32,
+                 n_offsets: int=5,
                  voxel_size: float=0.01,
-                 update_depth: int=3, 
+                 update_depth: int=3,
                  update_init_factor: int=100,
                  update_hierachy_factor: int=4,
                  use_feat_bank : bool = False,
@@ -59,10 +87,12 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 use_per_gaussian_seg : bool = False,
                  ):
 
         self.feat_dim = feat_dim
         self.n_offsets = n_offsets
+        self.use_per_gaussian_seg = use_per_gaussian_seg
         self.voxel_size = voxel_size
         self.update_depth = update_depth
         self.update_init_factor = update_init_factor
@@ -129,13 +159,14 @@ class GaussianModel:
             nn.Sigmoid()
         ).cuda()
 
-        # [修正] 语义分割头
-        # 这里的输出经过 Sigmoid 归一化到 [0,1]，方便 train.py 计算 loss
-        self.mlp_segmentation = nn.Sequential(
-            nn.Linear(self.feat_dim, 64),
-            nn.ReLU(True),
-            nn.Linear(64, 1),
-            nn.Sigmoid(), 
+        # [改进] 更深的语义分割头（3层残差，128 hidden）
+        seg_outputs = self.n_offsets if self.use_per_gaussian_seg else 1
+        self.mlp_segmentation = SegmentationHead(
+            feat_dim=self.feat_dim,
+            hidden_dim=128,
+            num_layers=3,
+            dropout=0.0,
+            num_outputs=seg_outputs,
         ).cuda()
 
 
@@ -243,16 +274,25 @@ class GaussianModel:
     def get_anchor_seg_logits(self):
         """
         供 train.py 中的 KNN Loss 调用。
-        返回每个锚点的分割预测值。
-        注意：因为 mlp_segmentation 包含 Sigmoid，所以这里返回的是 [0,1] 的概率值。
+        返回每个锚点的分割预测概率值 [0,1]。
+        若使用 per-Gaussian seg，则对 offsets 取平均后返回。
         """
-        # 1. 获取特征 (Detach)：不希望 KNN 改变锚点的特征或位置，只改变分割头的权重
         feat = self._anchor_feat.detach()
-
-        # 2. 计算分割值 (Keep Grad)：保留对 mlp_segmentation 的梯度
-        seg = self.mlp_segmentation(feat)  # [N, 1]
-        
+        seg = self.mlp_segmentation(feat)  # [N, 1] or [N, n_offsets]
+        if self.use_per_gaussian_seg and seg.dim() == 2 and seg.shape[1] > 1:
+            seg = seg.mean(dim=1, keepdim=True)
         return seg.squeeze(-1)
+
+    def get_anchor_seg_logits_raw(self):
+        """
+        [改进] 返回 Sigmoid 之前的 logit 值，供 logit-space KNN Loss 使用。
+        若使用 per-Gaussian seg，则对 offsets 取平均后返回。
+        """
+        feat = self._anchor_feat.detach()
+        logit = self.mlp_segmentation(feat, return_logit=True)  # [N, 1] or [N, n_offsets]
+        if self.use_per_gaussian_seg and logit.dim() == 2 and logit.shape[1] > 1:
+            logit = logit.mean(dim=1, keepdim=True)
+        return logit.squeeze(-1)
     
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)
@@ -397,25 +437,26 @@ class GaussianModel:
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "offset":
+            name = param_group.get("name", "")
+            if name == "offset":
                 lr = self.offset_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if param_group["name"] == "anchor":
+            if name == "anchor":
                 lr = self.anchor_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if param_group["name"] == "mlp_opacity":
+            if name == "mlp_opacity":
                 lr = self.mlp_opacity_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if param_group["name"] == "mlp_cov":
+            if name == "mlp_cov":
                 lr = self.mlp_cov_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if param_group["name"] == "mlp_color":
+            if name == "mlp_color":
                 lr = self.mlp_color_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
+            if self.use_feat_bank and name == "mlp_featurebank":
                 lr = self.mlp_featurebank_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
+            if self.appearance_dim > 0 and name == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
                 param_group['lr'] = lr
             

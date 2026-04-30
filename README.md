@@ -7,6 +7,8 @@
 
 ## News
 
+**[2026.04]** 🎈 This fork adds **semantic segmentation support** to Scaffold-GS, including per-anchor and per-Gaussian segmentation, KNN spatial consistency loss, and two-stage training. See [Semantic Segmentation](#semantic-segmentation) below.
+
 **[2024.09.25]** 🎈We propose **Octree-AnyGS**, a general anchor-based framework that supports explicit Gaussians (2D-GS, 3D-GS) and neural Gaussians (Scaffold-GS). Additionally, **Octree-GS** has been adapted to the aforementioned Gaussian primitives, enabling Level-of-Detail representation for large-scale scenes. This framework holds potential for application to other Gaussian-based methods, with relevant SIBR visualizations forthcoming.(https://github.com/city-super/Octree-AnyGS)
 
 **[2024.05.28]**  We update the [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) to conform to the file structure at training.
@@ -21,7 +23,7 @@
 
 **[2024.01.22]**  We add the appearance embedding to Scaffold-GS to handle wild scenes.
 
-**[2024.01.22]** 🎈👀 The [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) for Scaffold-GS is available now. 
+**[2024.01.22]** 🎈👀 The [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) for Scaffold-GS is available now.
 
 **[2023.12.10]** We release the code.
 
@@ -68,6 +70,106 @@ SET DISTUTILS_USE_SDK=1 # Windows only
 conda env create --file environment.yml
 conda activate scaffold_gs
 ```
+
+## Semantic Segmentation
+
+This fork extends Scaffold-GS with **semantic segmentation** capabilities. Each anchor (or per-Gaussian) can predict a segmentation logit, which is rendered into a binary mask alongside the RGB image.
+
+### Key Features
+
+- **Per-Anchor Segmentation** (`use_per_gaussian_seg=False`): Each anchor predicts a single segmentation value, shared by all its offset Gaussians via `repeat_interleave`.
+- **Per-Gaussian Segmentation** (`use_per_gaussian_seg=True`): Each offset Gaussian predicts its own independent segmentation logit, enabling finer mask boundaries.
+- **Deeper Segmentation Head** (`SegmentationHead`): A 3-layer residual MLP with 128 hidden units and LayerNorm, replacing the original shallow 2-layer head.
+- **KNN Spatial Consistency Loss**: Neighboring anchors are encouraged to have similar segmentation predictions via a symmetric BCE loss in probability space.
+- **Two-Stage Training** (`--seg_only`): Freeze all geometry and appearance parameters, and train only the segmentation head on a pre-trained model.
+
+### Architecture Details
+
+```python
+# SegmentationHead (scene/gaussian_model.py)
+SegmentationHead(feat_dim=32, hidden_dim=128, num_layers=3, dropout=0.0, num_outputs=1)
+# - input_proj + input_norm
+# - 3x residual blocks (Linear + LayerNorm + ReLU)
+# - logit_head (returns logit; sigmoid applied externally)
+```
+
+### Training Modes
+
+#### Mode 1: Joint Training (from scratch or pre-trained)
+Train geometry, appearance, and segmentation jointly. Semantic loss starts at `start_semantic_iter` with a warmup ramp.
+
+```bash
+python train.py -s data/dronev4_2 \
+  --start_semantic_iter 5000 \
+  --mask_weight 0.2 \
+  --knn_weight 0.05 \
+  --knn_every 100 \
+  --knn_offset 55 \
+  --focal_alpha 0.25 \
+  --use_per_gaussian_seg False
+```
+
+#### Mode 2: Two-Stage Training (`--seg_only`)
+Load a pre-trained geometry checkpoint, freeze all parameters, replace the segmentation head with a deeper MLP, and optimize only the seg head.
+
+```bash
+python train.py -s data/dronev4_2 \
+  --seg_only \
+  --start_semantic_iter 0 \
+  --iterations 10000 \
+  --mask_weight 0.2 \
+  --knn_weight 0.05 \
+  --load_iteration 30000
+```
+
+> In two-stage mode, densification is automatically disabled, and the optimizer only tracks `mlp_segmentation` parameters (~55K params).
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--use_per_gaussian_seg` | `False` | Enable per-Gaussian (per-offset) segmentation instead of per-anchor |
+| `--seg_only` | `False` | Two-stage mode: freeze geometry, only train seg head |
+| `--start_semantic_iter` | `0` | Iteration to start semantic loss |
+| `--mask_weight` | `0.0` | Weight for the mask BCE loss |
+| `--focal_alpha` | `0.25` | Focal loss alpha for handling class imbalance |
+| `--knn_weight` | `0.0` | Weight for KNN spatial consistency loss |
+| `--knn_every` | `100` | Compute KNN loss every N iterations |
+| `--knn_offset` | `0` | Delay KNN loss start by N iterations |
+
+### KNN Loss Improvement
+
+The KNN loss has been upgraded from MSE to **symmetric BCE** in probability space:
+
+```
+L_KNN = -0.5 * [ p_i*log(p_j) + (1-p_i)*log(1-p_j) + p_j*log(p_i) + (1-p_j)*log(1-p_i) ]
+```
+
+This avoids the "push-to-0.5" issue of MSE and forces neighboring anchors to agree on both foreground and background.
+
+### Renderer Fix
+
+During mask rendering, `opacity` is **detached** from the computation graph to prevent mask loss from interfering with the opacity MLP:
+
+```python
+rendered_mask, _ = rasterizer_mask(
+    ...,
+    opacities = opacity.detach(),  # Cut gradient path: mask loss -> opacity
+    ...
+)
+```
+
+### Recommended Configurations (based on `dronev4_2` experiments)
+
+| Scenario | `update_until` | `start_semantic_iter` | `focal_alpha` | Notes |
+|---|---|---|---|---|
+| Best Quality | `15000` | `5000` | `0.25` | Full densification + late semantic start |
+| Quality-Speed Balance | `0` (off) | `5000` | `0.25` | Pre-trained geometry, no densify, 85 FPS |
+| Two-Stage | N/A (off) | `0` | `0.25` | Freeze geometry, train seg head only |
+
+> See `试验记录.md` for detailed experimental results and ablation studies.
+
+---
 
 ## Data
 
@@ -145,7 +247,43 @@ bash ./single_train.sh
 - voxel_size: size for voxelizing the SfM points, smaller value denotes finer structure and higher overhead, '0' means using the median of each point's 1-NN distance as the voxel size.
 - update_init_factor: initial resolution for growing new anchors. A larger one will start placing new anchor in a coarser resolution.
 
-> For these public datasets, the configurations of 'voxel_size' and 'update_init_factor' can refer to the above batch training script. 
+> For these public datasets, the configurations of 'voxel_size' and 'update_init_factor' can refer to the above batch training script.
+
+### Training with Semantic Segmentation
+
+For joint training (geometry + segmentation):
+
+```bash
+python train.py \
+  -s data/dronev4_2 \
+  --exp_name dronev4_2_semantic \
+  --start_semantic_iter 5000 \
+  --mask_weight 0.2 \
+  --knn_weight 0.05 \
+  --knn_every 100 \
+  --knn_offset 55 \
+  --focal_alpha 0.25 \
+  --update_until 15000 \
+  --iterations 30000
+```
+
+For two-stage segmentation training (requires a pre-trained checkpoint):
+
+```bash
+python train.py \
+  -s data/dronev4_2 \
+  --exp_name dronev4_2_twostage \
+  --seg_only \
+  --start_semantic_iter 0 \
+  --mask_weight 0.2 \
+  --knn_weight 0.05 \
+  --knn_every 100 \
+  --knn_offset 55 \
+  --iterations 10000 \
+  --load_iteration 30000
+```
+
+> For scenes with a mask/ folder containing binary segmentation ground truth (0=background, 255=foreground), the dataloader will automatically load and pair masks with images. 
 
 
 This script will store the log (with running-time code) into ```outputs/dataset_name/scene_name/exp_name/cur_time``` automatically.

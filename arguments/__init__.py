@@ -75,7 +75,8 @@ class ModelParams(ParamGroup):
         self.lowpoly = False
         self.ds = 1
         self.ratio = 1 # sampling the input point cloud
-        self.undistorted = False 
+        self.undistorted = False
+        self.use_per_gaussian_seg = False 
         
         # In the Bungeenerf dataset, we propose to set the following three parameters to True,
         # Because there are enough dist variations.
@@ -195,6 +196,9 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+
+        # Two-stage training: only optimize segmentation head
+        self.seg_only = False
 
         super().__init__(parser, "Optimization Parameters")
 
