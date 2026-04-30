@@ -1,4 +1,7 @@
-# Scaffold-GS: Structured 3D Gaussians for View-Adaptive Rendering
+# Scaffold-GS-Semantic: Scaffold-GS with Semantic Segmentation Support
+
+> **This is a fork of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) extended with semantic segmentation capabilities.**  
+> Original authors: [Tao Lu](https://github.com/inspirelt), [Mulin Yu](https://scholar.google.com/citations?user=w0Od3hQAAAAJ), [Linning Xu](https://eveneveno.github.io/lnxu), [Yuanbo Xiangli](https://kam1107.github.io/), [Limin Wang](https://wanglimin.github.io/), [Dahua Lin](http://dahua.site/), [Bo Dai](https://daibo.info/)
 
 [Tao Lu](https://github.com/inspirelt), [Mulin Yu](https://scholar.google.com/citations?user=w0Od3hQAAAAJ), [Linning Xu](https://eveneveno.github.io/lnxu), [Yuanbo Xiangli](https://kam1107.github.io/), [Limin Wang](https://wanglimin.github.io/), [Dahua Lin](http://dahua.site/), [Bo Dai](https://daibo.info/) <br />
 
@@ -30,6 +33,22 @@
 ## TODO List
 - [ ] Explore on removing the MLP module
 - [ ] Improve the training configuration system
+
+## What is Different in This Fork?
+
+This repository extends the original **Scaffold-GS** with the following capabilities:
+
+| Feature | Original Scaffold-GS | This Fork |
+|---|---|---|
+| Semantic Segmentation | ❌ | ✅ Per-anchor / Per-Gaussian |
+| Segmentation Head | — | ✅ 3-layer residual MLP (128 hidden) |
+| Two-Stage Training | ❌ | ✅ Freeze geometry, train seg head only |
+| KNN Spatial Consistency | ❌ | ✅ Symmetric BCE loss in probability space |
+| Mask Rendering Fix | — | ✅ Opacity detach to prevent gradient conflict |
+
+See the [Semantic Segmentation](#semantic-segmentation) section below for details.
+
+---
 
 ## Overview
 
