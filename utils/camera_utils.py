@@ -58,12 +58,21 @@ def loadCam(args, id, cam_info, resolution_scale):
         sm = F.interpolate(sm, size=(resolution[1], resolution[0]), mode="nearest")
         semantic_mask = sm.squeeze(0)    # 回到 [1, H_res, W_res]
 
+    # 语义权重图：从 CameraInfo 中读取，并缩放到当前分辨率
+    semantic_weight = getattr(cam_info, "semantic_weight", None)
+    if semantic_weight is not None:
+        sw = semantic_weight.unsqueeze(0)  # [1, 1, H, W]
+        # 使用 bilinear 插值保持概率连续性
+        sw = F.interpolate(sw, size=(resolution[1], resolution[0]), mode="bilinear", align_corners=False)
+        semantic_weight = sw.squeeze(0)    # 回到 [1, H_res, W_res]
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id,
                   data_device=args.data_device,
-                  semantic_mask=semantic_mask)
+                  semantic_mask=semantic_mask,
+                  semantic_weight=semantic_weight)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

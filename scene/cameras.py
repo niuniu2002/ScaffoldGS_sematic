@@ -24,6 +24,7 @@ class Camera(nn.Module):
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0,
                  data_device: str = "cuda",
                  semantic_mask: Optional[torch.Tensor] = None,  # 新增参数：语义 mask Tensor
+                 semantic_weight: Optional[torch.Tensor] = None,  # 新增参数：语义权重图 Tensor
                  ):
         super(Camera, self).__init__()
 
@@ -56,6 +57,12 @@ class Camera(nn.Module):
         if semantic_mask is not None:
             # semantic_mask: [1, H, W]，这里仅负责搬运到对应设备
             self.semantic_mask = semantic_mask.to(self.data_device)
+
+        # 保存语义权重图（已在 dataset_readers 中读成 Tensor）
+        self.semantic_weight = None
+        if semantic_weight is not None:
+            # semantic_weight: [1, H, W]，像素值范围 [0, 1]
+            self.semantic_weight = semantic_weight.to(self.data_device)
 
         self.zfar = 100.0
         self.znear = 0.01

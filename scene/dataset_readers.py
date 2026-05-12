@@ -51,6 +51,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     semantic_mask: Optional[torch.Tensor]
+    semantic_weight: Optional[torch.Tensor]
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -142,11 +143,35 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
                 loaded_mask = loaded_mask[:, :, 0]  # 取单通道
             loaded_mask = loaded_mask.unsqueeze(0).float() / 255.0
 
+        # -------------------------
+        # 读取语义权重图（可选）
+        # 假设位于 <scene_root>/semantic_weights 下，与图像同名（.png 或 .jpg）
+        # 像素值含义：0=背景置信度极高，128=完全不确定，255=前景置信度极高
+        # -------------------------
+        weight_path_png = os.path.join(scene_root, "semantic_weights", image_name + ".png")
+        weight_path_jpg = os.path.join(scene_root, "semantic_weights", image_name + ".jpg")
+        loaded_weight = None
+
+        target_weight_path = weight_path_png if os.path.exists(weight_path_png) else weight_path_jpg
+
+        if os.path.exists(target_weight_path):
+            weight_pil = Image.open(target_weight_path)
+            # 确保尺寸与 RGB 图一致（使用 BILINEAR 以保持概率连续性）
+            if weight_pil.size != image.size:
+                weight_pil = weight_pil.resize(image.size, Image.BILINEAR)
+
+            # 转 Tensor 并归一化 -> [1, H, W]
+            weight_np = np.array(weight_pil).astype(np.float32)
+            if len(weight_np.shape) == 3:
+                weight_np = weight_np[:, :, 0]
+            loaded_weight = torch.from_numpy(weight_np).unsqueeze(0) / 255.0
+
         # print(f'image: {image.size}')
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                       image_path=image_path, image_name=image_name, width=width, height=height,
-                      semantic_mask=loaded_mask)
+                      semantic_mask=loaded_mask,
+                      semantic_weight=loaded_weight)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos

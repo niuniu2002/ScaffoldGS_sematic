@@ -1,0 +1,11 @@
+# 保守语义权重策略 patch
+# 将 hard 策略中低置信度区域的权重从 0 改为 1.0（不忽略任何像素）
+
+# 原代码（hard 策略）:
+# sem_pixel_weight = torch.zeros_like(abs_conf)
+# sem_pixel_weight[abs_conf >= high_t] = 1.0
+# sem_pixel_weight[(abs_conf >= low_t) & (abs_conf < high_t)] = boost
+
+# 新代码（保守 hard 策略）:
+# sem_pixel_weight = torch.ones_like(abs_conf)  # 默认全部保留
+# sem_pixel_weight[abs_conf >= high_t] = boost   # 高置信度区域增强

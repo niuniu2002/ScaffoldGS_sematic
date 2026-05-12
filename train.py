@@ -40,6 +40,7 @@ import torchvision.transforms.functional as tf
 import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from utils.graphics_utils import geom_transform_points
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -103,6 +104,149 @@ def focal_loss(pred: torch.Tensor,
         return loss.sum()
     raise ValueError(f"Unsupported reduction: {reduction}")
 
+
+def compute_anchor_fg_voting_loss(
+    xyz: torch.Tensor,
+    seg_logits: torch.Tensor,
+    opacity: torch.Tensor,
+    anchor_idx: torch.Tensor,
+    viewpoint_cam,
+    gt_mask: torch.Tensor,
+    fg_ratio_thr: float = 0.3,
+    max_samples: int = 4096,
+    detach_xyz: bool = True,
+):
+    """
+    Foreground-only Anchor Voting Loss.
+
+    For each anchor, projects its child Gaussians to 2D and samples the GT mask.
+    Computes a per-anchor foreground ratio using opacity*confidence weighting.
+    Only anchors with anchor_fg_ratio > fg_ratio_thr are supervised (target=1).
+    Background supervision is left to the Rendered Mask Loss (focal+dice).
+
+    Args:
+        xyz:          [M, 3]   child Gaussian world coordinates
+        seg_logits:   [M, 1]   pre-sigmoid segmentation logits
+        opacity:      [M, 1]   child Gaussian opacity
+        anchor_idx:   [M]      anchor index for each child Gaussian
+        viewpoint_cam: Camera object with full_proj_transform
+        gt_mask:      [1, H, W] ground-truth semantic mask (0=bg, 1=fg)
+        fg_ratio_thr: float, threshold to qualify as a foreground anchor
+        max_samples:  int, max number of FG anchors to supervise per iteration
+        detach_xyz:   bool, whether to detach xyz before projection
+
+    Returns:
+        loss: scalar tensor (0.0 if no FG anchors)
+        info: dict with fg_anchor_count, anchor_fg_ratio_mean,
+              pred_fg_mean_on_fg_anchor, anchor_fg_loss
+    """
+    info = {
+        "fg_anchor_count": 0,
+        "anchor_fg_ratio_mean": 0.0,
+        "pred_fg_mean_on_fg_anchor": 0.0,
+        "anchor_fg_loss": 0.0,
+    }
+
+    if xyz.shape[0] == 0 or gt_mask is None:
+        return torch.tensor(0.0, device=xyz.device), info
+
+    if detach_xyz:
+        xyz = xyz.detach()
+
+    n_anchors = int(anchor_idx.max().item()) + 1
+
+    # 1. Project child Gaussians to NDC
+    p_ndc = geom_transform_points(xyz, viewpoint_cam.full_proj_transform)  # [M, 3]
+
+    in_image = (p_ndc[:, 0] >= -1.0) & (p_ndc[:, 0] <= 1.0) & \
+               (p_ndc[:, 1] >= -1.0) & (p_ndc[:, 1] <= 1.0) & \
+               (p_ndc[:, 2] >= 0.0)  & (p_ndc[:, 2] <= 1.0)
+
+    # 2. Sample GT mask at projected child positions
+    gt_mask_norm = gt_mask.float()
+    if gt_mask_norm.max() > 1.0:
+        gt_mask_norm = gt_mask_norm / 255.0
+
+    grid_2d = torch.stack([p_ndc[:, 0], -p_ndc[:, 1]], dim=-1)  # [M, 2]
+    grid_2d = grid_2d.unsqueeze(0).unsqueeze(0)  # [1, 1, M, 2]
+
+    sampled_mask = torch.nn.functional.grid_sample(
+        gt_mask_norm.unsqueeze(0),  # [1, 1, H, W]
+        grid_2d,  # [1, 1, M, 2]
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=False,
+    ).squeeze()  # [M]
+
+    # 3. Per-child confidence (how close to 0 or 1)
+    conf = torch.abs(sampled_mask - 0.5) * 2.0  # [M]
+
+    # 4. Per-child weight = opacity * confidence
+    opacity_squeezed = opacity.view(-1)  # [M]
+    weight = opacity_squeezed * conf  # [M]
+
+    # Only keep children that are in image and have non-zero weight
+    valid_child = in_image & (weight > 1e-6)
+    valid_count = int(valid_child.sum().item())
+
+    if valid_count == 0:
+        return torch.tensor(0.0, device=xyz.device), info
+
+    # 5. Aggregate per-anchor foreground ratio
+    valid_idx = anchor_idx[valid_child]
+    valid_sampled_mask = sampled_mask[valid_child]
+    valid_weight = weight[valid_child]
+
+    fg_weight = torch.zeros(n_anchors, device=xyz.device)
+    total_weight = torch.zeros(n_anchors, device=xyz.device)
+
+    fg_weight = fg_weight.index_add(0, valid_idx, valid_sampled_mask * valid_weight)
+    total_weight = total_weight.index_add(0, valid_idx, valid_weight)
+
+    valid_anchors = total_weight > 1e-6
+    anchor_fg_ratio = torch.zeros(n_anchors, device=xyz.device)
+    anchor_fg_ratio[valid_anchors] = fg_weight[valid_anchors] / total_weight[valid_anchors].clamp(min=1e-6)
+
+    # 6. Select foreground anchors (anchor_fg_ratio > fg_ratio_thr)
+    fg_mask = anchor_fg_ratio > fg_ratio_thr
+    fg_anchor_count = int(fg_mask.sum().item())
+
+    info["fg_anchor_count"] = fg_anchor_count
+
+    if fg_anchor_count == 0:
+        return torch.tensor(0.0, device=xyz.device), info
+
+    # 7. Get per-anchor seg logits (average over all children; they should be identical for per-anchor seg)
+    anchor_logits_sum = torch.zeros(n_anchors, device=xyz.device)
+    anchor_logits_count = torch.zeros(n_anchors, device=xyz.device)
+    anchor_logits_sum = anchor_logits_sum.index_add(0, anchor_idx, seg_logits.view(-1))
+    anchor_logits_count = anchor_logits_count.index_add(0, anchor_idx, torch.ones_like(anchor_idx, dtype=torch.float))
+    anchor_logits = anchor_logits_sum / anchor_logits_count.clamp(min=1)
+
+    fg_logits = anchor_logits[fg_mask]
+    fg_targets = torch.ones_like(fg_logits)
+
+    # 8. Subsample if too many
+    if fg_logits.numel() > max_samples:
+        perm = torch.randperm(fg_logits.numel(), device=fg_logits.device)[:max_samples]
+        fg_logits = fg_logits[perm]
+        fg_targets = fg_targets[perm]
+        info["fg_anchor_count"] = fg_logits.numel()
+
+    # 9. BCEWithLogitsLoss on FG anchors only (target=1)
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(fg_logits, fg_targets, reduction='mean')
+
+    # 10. Debug info
+    with torch.no_grad():
+        pred_fg_mean = torch.sigmoid(fg_logits).mean().item()
+        anchor_fg_ratio_mean = anchor_fg_ratio[fg_mask].mean().item()
+
+    info["anchor_fg_ratio_mean"] = float(anchor_fg_ratio_mean)
+    info["pred_fg_mean_on_fg_anchor"] = float(pred_fg_mean)
+    info["anchor_fg_loss"] = float(loss.item())
+
+    return loss, info
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -149,16 +293,20 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     # [Two-Stage] 如果只训练 segmentation，冻结所有参数并替换 optimizer
     if getattr(opt, 'seg_only', False):
-        logger.info("\n[Two-Stage Mode] Replacing seg head with deep MLP and freezing all other parameters.")
-        # 重新初始化更深的分割头（替换从 checkpoint 加载的浅 MLP）
-        seg_outputs = gaussians.n_offsets if gaussians.use_per_gaussian_seg else 1
-        gaussians.mlp_segmentation = SegmentationHead(
-            feat_dim=gaussians.feat_dim,
-            hidden_dim=128,
-            num_layers=3,
-            dropout=0.0,
-            num_outputs=seg_outputs,
-        ).cuda()
+        reuse_head = getattr(opt, 'seg_only_reuse_head', False)
+        if reuse_head:
+            logger.info("\n[Two-Stage Mode] Reusing original seg head and freezing all other parameters.")
+        else:
+            logger.info("\n[Two-Stage Mode] Replacing seg head with deep MLP and freezing all other parameters.")
+            # 重新初始化更深的分割头（替换从 checkpoint 加载的浅 MLP）
+            seg_outputs = gaussians.n_offsets if gaussians.use_per_gaussian_seg else 1
+            gaussians.mlp_segmentation = SegmentationHead(
+                feat_dim=gaussians.feat_dim,
+                hidden_dim=128,
+                num_layers=3,
+                dropout=0.0,
+                num_outputs=seg_outputs,
+            ).cuda()
         # Freeze all explicit parameters
         for attr in ('_anchor', '_offset', '_anchor_feat', '_scaling', '_rotation', '_opacity'):
             p = getattr(gaussians, attr, None)
@@ -286,6 +434,47 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 uncertainty_min = float(getattr(opt, "uncertainty_min", 0.1))
                 uncertainty_power = float(getattr(opt, "uncertainty_power", 2.0))
                 uncertainty_weight = uncertainty_min + (1.0 - uncertainty_min) * torch.pow(conf, uncertainty_power)
+
+                # [新增] 语义权重图加权（Semantic Weight Map）
+                sem_weight_map = viewpoint_cam.semantic_weight if hasattr(viewpoint_cam, 'semantic_weight') else None
+                if getattr(opt, 'use_semantic_weight', False) and sem_weight_map is not None:
+                    sem_w = sem_weight_map.cuda().float()
+                    # 语义权重图: 像素值表示外部模型对该像素的置信度
+                    # 0.5 为决策边界，越接近 0 或 1 越确定
+                    abs_conf = torch.abs(sem_w - 0.5) * 2.0  # [0, 1], 1=最确定
+
+                    strategy = getattr(opt, 'sem_weight_strategy', 'hard')
+                    if strategy == 'hard':
+                        high_t = float(getattr(opt, 'sem_weight_high', 0.7))
+                        low_t = float(getattr(opt, 'sem_weight_low', 0.1))
+                        boost = float(getattr(opt, 'sem_weight_boost', 2.0))
+                        sem_pixel_weight = torch.zeros_like(abs_conf)
+                        sem_pixel_weight[abs_conf >= high_t] = 1.0
+                        sem_pixel_weight[(abs_conf >= low_t) & (abs_conf < high_t)] = boost
+                        # abs_conf < low_t 保持 0（忽略）
+                    elif strategy == 'conservative_hard':
+                        high_t = float(getattr(opt, 'sem_weight_high', 0.7))
+                        boost = float(getattr(opt, 'sem_weight_boost', 2.0))
+                        # [实验4] 保守策略: 不忽略任何像素, 低置信度保持1.0, 高置信度增强
+                        sem_pixel_weight = torch.ones_like(abs_conf)
+                        sem_pixel_weight[abs_conf >= high_t] = boost
+                    else:  # smooth
+                        peak = float(getattr(opt, 'sem_weight_smooth_peak', 0.5))
+                        # 倒抛物线: 在 peak 处权重最大
+                        denom = peak if peak > 1e-6 else 1e-6
+                        sem_pixel_weight = 1.0 - 4.0 * ((abs_conf - peak) / denom) ** 2
+                        sem_pixel_weight = torch.clamp(sem_pixel_weight, min=0.0)
+                        # 高置信度区域保底权重 1.0
+                        high_t = float(getattr(opt, 'sem_weight_high', 0.7))
+                        sem_pixel_weight = torch.where(abs_conf >= high_t, torch.ones_like(sem_pixel_weight), sem_pixel_weight)
+
+                    # 将语义权重与现有 uncertainty_weight 相乘（叠加外部先验）
+                    uncertainty_weight = uncertainty_weight * sem_pixel_weight
+
+                    if iteration % 100 == 0:
+                        active_ratio = (sem_pixel_weight > 0).float().mean().item()
+                        boost_ratio = (sem_pixel_weight > 1.0).float().mean().item()
+                        print(f"Iter {iteration}: SemanticWeight active={active_ratio:.2%} boost={boost_ratio:.2%}")
 
                 # Pixel-wise focal loss (handles class imbalance)
                 raw_loss = focal_loss(
@@ -416,6 +605,66 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     pass
         
         # =========================================================================================
+
+        # 3. Foreground-only Anchor Voting Loss
+        ar_weight = float(getattr(opt, "anchor_fg_weight", 0.0))
+        ar_start = int(getattr(opt, "anchor_fg_start_iter", 5000))
+        ar_every = int(getattr(opt, "anchor_fg_every", 10))
+        ar_fg_ratio_thr = float(getattr(opt, "anchor_fg_ratio_thr", 0.3))
+        ar_max_samples = int(getattr(opt, "anchor_fg_max_samples", 4096))
+        ar_detach_xyz = bool(getattr(opt, "anchor_fg_detach_xyz", True))
+        ar_ramp = int(getattr(opt, "anchor_fg_ramp", 1000))
+
+        do_ar = (ar_weight > 0.0) and (iteration >= ar_start) and ((iteration - ar_start) % ar_every == 0)
+
+        if do_ar and gt_mask is not None:
+            try:
+                neural_xyz = render_pkg.get("neural_xyz")
+                neural_seg_logits = render_pkg.get("neural_seg_logits")
+                neural_opacity_filtered = render_pkg.get("neural_opacity_filtered")
+                neural_anchor_idx = render_pkg.get("neural_anchor_idx")
+
+                if (neural_xyz is not None and neural_seg_logits is not None and
+                    neural_opacity_filtered is not None and neural_anchor_idx is not None):
+                    loss_ar, ar_info = compute_anchor_fg_voting_loss(
+                        xyz=neural_xyz,
+                        seg_logits=neural_seg_logits,
+                        opacity=neural_opacity_filtered,
+                        anchor_idx=neural_anchor_idx,
+                        viewpoint_cam=viewpoint_cam,
+                        gt_mask=gt_mask,
+                        fg_ratio_thr=ar_fg_ratio_thr,
+                        max_samples=ar_max_samples,
+                        detach_xyz=ar_detach_xyz,
+                    )
+
+                    # Safe linear ramp
+                    ar_w = ar_weight * min(1.0, max(0.0, (iteration - ar_start) / max(ar_ramp, 1)))
+
+                    if ar_w > 0 and loss_ar.item() > 0:
+                        loss = loss + ar_w * loss_ar
+
+                    if iteration % 100 == 0:
+                        fg_count = ar_info.get("fg_anchor_count", 0)
+                        fg_ratio_mean = ar_info.get("anchor_fg_ratio_mean", 0.0)
+                        pred_fg_mean = ar_info.get("pred_fg_mean_on_fg_anchor", 0.0)
+                        ar_loss_val = ar_info.get("anchor_fg_loss", 0.0)
+                        print(
+                            f"Iter {iteration}: FG-Anchor-Vote Loss={ar_loss_val:.5f} "
+                            f"w={ar_w:.4f} fg_count={fg_count} "
+                            f"fg_ratio_mean={fg_ratio_mean:.3f} pred_fg_mean={pred_fg_mean:.3f}"
+                        )
+                        if fg_count == 0:
+                            print(
+                                f"[WARNING] Iter {iteration}: FG-Anchor fg_count=0! "
+                                f"Check projection/fg_ratio_thr."
+                            )
+            except Exception as e:
+                print(f"[Warning] FG-Anchor-Vote Loss skipped at iter {iteration}: {e}")
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         loss.backward()
         

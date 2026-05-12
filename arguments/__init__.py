@@ -15,6 +15,19 @@ from argparse import ArgumentParser, Namespace
 import sys
 import os
 
+
+def str2bool(v):
+    """Convert string to boolean for argparse."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise ValueError('Boolean value expected.')
+
+
 class GroupParams:
     pass
 
@@ -30,7 +43,7 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=str2bool, nargs='?', const=True)
                 else:
                     # Compatibility: allow `--r` as an alias for `--resolution`.
                     # The original code already supports `--resolution` and `-r`.
@@ -40,7 +53,7 @@ class ParamGroup:
                         group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    group.add_argument("--" + key, default=value, type=str2bool, nargs='?', const=True)
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -186,6 +199,20 @@ class OptimizationParams(ParamGroup):
         self.uncertainty_min = 0.1
         # Shape of the confidence-to-weight mapping; >1 further downweights uncertain (edge) pixels.
         self.uncertainty_power = 2.0
+
+        # --- Semantic weight map (optional) ---
+        # 是否启用外部语义模型生成的语义权重图
+        self.use_semantic_weight = False
+        # 权重策略: "hard" = 三段式硬阈值, "smooth" = 连续平滑函数
+        self.sem_weight_strategy = "hard"
+        # 高置信度阈值: abs_conf >= 该值视为高置信度，权重=1.0
+        self.sem_weight_high = 0.7
+        # 低置信度阈值: abs_conf < 该值视为低置信度，权重=0.0（忽略）
+        self.sem_weight_low = 0.1
+        # 中等置信度区域权重提升倍数（着重关照）
+        self.sem_weight_boost = 2.0
+        # smooth 策略下峰值位置 (0~0.5)
+        self.sem_weight_smooth_peak = 0.5
         
         # for anchor densification
         self.start_stat = 500
@@ -197,8 +224,19 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # --- Foreground-only Anchor Voting Loss ---
+        self.anchor_fg_weight = 0.0
+        self.anchor_fg_start_iter = 5000
+        self.anchor_fg_every = 10
+        self.anchor_fg_ratio_thr = 0.3
+        self.anchor_fg_max_samples = 4096
+        self.anchor_fg_detach_xyz = True
+        self.anchor_fg_ramp = 1000
+
         # Two-stage training: only optimize segmentation head
         self.seg_only = False
+        # Two-stage 模式下保留原始 seg head 权重（不重新初始化深层 MLP）
+        self.seg_only_reuse_head = False
 
         super().__init__(parser, "Optimization Parameters")
 

@@ -48,7 +48,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # per-anchor segmentation confidence
     # Detach to avoid segmentation supervision pulling shared features (which can hurt RGB reconstruction).
-    segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, 1]
+    segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, 1] or [N, K], sigmoid output
+    segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
@@ -95,9 +96,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # expand per-anchor segmentation to per-Gaussian
     if pc.use_per_gaussian_seg:
-        segmentation_all = segmentation_anchor.view(-1, 1)  # [N*k, 1]
+        segmentation_all = segmentation_anchor.view(-1, 1)       # [N*k, 1]
+        seg_logits_all = segmentation_anchor_logit.view(-1, 1)   # [N*k, 1]
     else:
-        segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)  # [N*k, 1]
+        segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)       # [N*k, 1]
+        seg_logits_all = segmentation_anchor_logit.repeat_interleave(pc.n_offsets, dim=0)   # [N*k, 1]
+
+    # anchor index for each child Gaussian (before opacity masking)
+    anchor_idx_all = torch.arange(anchor.shape[0], device=anchor.device).repeat_interleave(pc.n_offsets)  # [N*k]
 
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
@@ -114,8 +120,11 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = offsets * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets
 
-    # [修改点1] 无论是否训练，始终返回所有数据（包括 segmentation）
-    return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation
+    # mask seg logits and anchor indices for region consistency loss
+    seg_logits_masked = seg_logits_all[mask]      # [M, 1]
+    anchor_idx_masked = anchor_idx_all[mask]       # [M]
+
+    return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation, seg_logits_masked, anchor_idx_masked
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
     """
@@ -124,7 +133,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
         
     # [修改点2] 始终接收完整返回值
-    xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    (xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation,
+     seg_logits_masked, anchor_idx_masked) = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
 
     # Create zero tensor.
     screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
@@ -211,8 +221,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "radii": radii,
             "selection_mask": mask,
             "neural_opacity": neural_opacity,
+            "neural_opacity_filtered": opacity,   # [M, 1]   mask后的child Gaussian opacity
             "scaling": scaling,
             "segmentation": segmentation,
+            "neural_xyz": xyz,                    # [M, 3]   child Gaussian world coords
+            "neural_seg_logits": seg_logits_masked,  # [M, 1]   pre-sigmoid seg logits
+            "neural_anchor_idx": anchor_idx_masked,   # [M]      anchor index per child
             }
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
