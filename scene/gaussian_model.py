@@ -287,9 +287,17 @@ class GaussianModel:
         """
         [改进] 返回 Sigmoid 之前的 logit 值，供 logit-space KNN Loss 使用。
         若使用 per-Gaussian seg，则对 offsets 取平均后返回。
+        
+        兼容 JIT traced 模型：JIT trace 只捕获默认 forward 路径，
+        不支持 return_logit 参数，此时通过 sigmoid 输出反推 logit。
         """
         feat = self._anchor_feat.detach()
-        logit = self.mlp_segmentation(feat, return_logit=True)  # [N, 1] or [N, n_offsets]
+        if getattr(self, 'mlp_segmentation_is_jit', False):
+            # JIT traced 模型不支持 return_logit，fallback 到 sigmoid -> logit
+            seg = self.mlp_segmentation(feat)
+            logit = torch.logit(seg.clamp(min=1e-7, max=1-1e-7))
+        else:
+            logit = self.mlp_segmentation(feat, return_logit=True)  # [N, 1] or [N, n_offsets]
         if self.use_per_gaussian_seg and logit.dim() == 2 and logit.shape[1] > 1:
             logit = logit.mean(dim=1, keepdim=True)
         return logit.squeeze(-1)
@@ -891,6 +899,7 @@ class GaussianModel:
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
             self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
             self.mlp_segmentation = torch.jit.load(os.path.join(path, 'segmentation_mlp.pt')).cuda()
+            self.mlp_segmentation_is_jit = True
             if self.use_feat_bank:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:

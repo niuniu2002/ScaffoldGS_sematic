@@ -247,6 +247,153 @@ def compute_anchor_fg_voting_loss(
 
     return loss, info
 
+
+def compute_anchor_fg_soft_curve_loss(
+    xyz: torch.Tensor,
+    seg_logits: torch.Tensor,
+    opacity: torch.Tensor,
+    anchor_idx: torch.Tensor,
+    viewpoint_cam,
+    gt_mask: torch.Tensor,
+    tau: float = 0.35,
+    temp: float = 0.10,
+    min_ratio: float = 0.10,
+    max_samples: int = 4096,
+    detach_xyz: bool = True,
+):
+    """
+    Anchor-level Soft Foreground Curve Loss (exp08).
+
+    1. 保留原有 anchor_fg_ratio 统计逻辑（投影、采样、按 opacity*conf 加权聚合）。
+    2. 对每个 anchor 计算 soft_weight = sigmoid((fg_ratio - tau) / temp)。
+    3. 只保留 fg_ratio > min_ratio 的 anchor。
+    4. target = 1 (foreground)。
+    5. loss = BCEWithLogits(pred_logit, ones) * soft_weight。
+    6. 返回未乘以 time_weight 的 raw loss，由调用方乘 time_weight。
+
+    Returns:
+        loss: scalar tensor (0.0 if no valid anchors)
+        info: dict with selected_count, fg_ratio_mean, soft_weight_mean, pred_fg_mean, anchor_soft_loss
+    """
+    info = {
+        "selected_count": 0,
+        "fg_ratio_mean": 0.0,
+        "soft_weight_mean": 0.0,
+        "pred_fg_mean": 0.0,
+        "anchor_soft_loss": 0.0,
+    }
+
+    if xyz.shape[0] == 0 or gt_mask is None:
+        return torch.tensor(0.0, device=xyz.device), info
+
+    if detach_xyz:
+        xyz = xyz.detach()
+
+    n_anchors = int(anchor_idx.max().item()) + 1
+
+    # 1. Project child Gaussians to NDC
+    p_ndc = geom_transform_points(xyz, viewpoint_cam.full_proj_transform)
+    in_image = (p_ndc[:, 0] >= -1.0) & (p_ndc[:, 0] <= 1.0) & \
+               (p_ndc[:, 1] >= -1.0) & (p_ndc[:, 1] <= 1.0) & \
+               (p_ndc[:, 2] >= 0.0)  & (p_ndc[:, 2] <= 1.0)
+
+    # 2. Sample GT mask at projected child positions
+    gt_mask_norm = gt_mask.float()
+    if gt_mask_norm.max() > 1.0:
+        gt_mask_norm = gt_mask_norm / 255.0
+
+    grid_2d = torch.stack([p_ndc[:, 0], -p_ndc[:, 1]], dim=-1)
+    grid_2d = grid_2d.unsqueeze(0).unsqueeze(0)
+
+    sampled_mask = torch.nn.functional.grid_sample(
+        gt_mask_norm.unsqueeze(0),
+        grid_2d,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=False,
+    ).squeeze()
+
+    # 3. Per-child confidence
+    conf = torch.abs(sampled_mask - 0.5) * 2.0
+
+    # 4. Per-child weight = opacity * confidence
+    opacity_squeezed = opacity.view(-1)
+    weight = opacity_squeezed * conf
+
+    valid_child = in_image & (weight > 1e-6)
+    valid_count = int(valid_child.sum().item())
+
+    if valid_count == 0:
+        return torch.tensor(0.0, device=xyz.device), info
+
+    # 5. Aggregate per-anchor foreground ratio (same as hard version)
+    valid_idx = anchor_idx[valid_child]
+    valid_sampled_mask = sampled_mask[valid_child]
+    valid_weight = weight[valid_child]
+
+    fg_weight = torch.zeros(n_anchors, device=xyz.device)
+    total_weight = torch.zeros(n_anchors, device=xyz.device)
+
+    fg_weight = fg_weight.index_add(0, valid_idx, valid_sampled_mask * valid_weight)
+    total_weight = total_weight.index_add(0, valid_idx, valid_weight)
+
+    valid_anchors = total_weight > 1e-6
+    anchor_fg_ratio = torch.zeros(n_anchors, device=xyz.device)
+    anchor_fg_ratio[valid_anchors] = fg_weight[valid_anchors] / total_weight[valid_anchors].clamp(min=1e-6)
+
+    # 6. Soft selection: fg_ratio > min_ratio
+    soft_mask = anchor_fg_ratio > min_ratio
+    selected_count = int(soft_mask.sum().item())
+    info["selected_count"] = selected_count
+
+    if selected_count == 0:
+        return torch.tensor(0.0, device=xyz.device), info
+
+    # 7. Get per-anchor seg logits
+    anchor_logits_sum = torch.zeros(n_anchors, device=xyz.device)
+    anchor_logits_count = torch.zeros(n_anchors, device=xyz.device)
+    anchor_logits_sum = anchor_logits_sum.index_add(0, anchor_idx, seg_logits.view(-1))
+    anchor_logits_count = anchor_logits_count.index_add(0, anchor_idx, torch.ones_like(anchor_idx, dtype=torch.float))
+    anchor_logits = anchor_logits_sum / anchor_logits_count.clamp(min=1)
+
+    selected_logits = anchor_logits[soft_mask]
+    selected_fg_ratio = anchor_fg_ratio[soft_mask]
+
+    # 8. Soft weight = sigmoid((fg_ratio - tau) / temp)
+    soft_weight = torch.sigmoid((selected_fg_ratio - tau) / temp)
+
+    # 9. BCEWithLogitsLoss (target=1) weighted by soft_weight
+    targets = torch.ones_like(selected_logits)
+    loss_per_anchor = torch.nn.functional.binary_cross_entropy_with_logits(
+        selected_logits, targets, reduction='none'
+    )
+    loss = (loss_per_anchor * soft_weight).sum() / soft_weight.sum().clamp(min=1e-6)
+
+    # 10. Subsample if too many
+    if selected_logits.numel() > max_samples:
+        perm = torch.randperm(selected_logits.numel(), device=selected_logits.device)[:max_samples]
+        selected_logits = selected_logits[perm]
+        soft_weight = soft_weight[perm]
+        targets = targets[perm]
+        loss_per_anchor = torch.nn.functional.binary_cross_entropy_with_logits(
+            selected_logits, targets, reduction='none'
+        )
+        loss = (loss_per_anchor * soft_weight).sum() / soft_weight.sum().clamp(min=1e-6)
+        info["selected_count"] = max_samples
+
+    # 11. Debug info
+    with torch.no_grad():
+        pred_fg_mean = torch.sigmoid(selected_logits).mean().item()
+        fg_ratio_mean = selected_fg_ratio.mean().item()
+        soft_weight_mean = soft_weight.mean().item()
+
+    info["fg_ratio_mean"] = float(fg_ratio_mean)
+    info["soft_weight_mean"] = float(soft_weight_mean)
+    info["pred_fg_mean"] = float(pred_fg_mean)
+    info["anchor_soft_loss"] = float(loss.item())
+
+    return loss, info
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -661,6 +808,78 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                             )
             except Exception as e:
                 print(f"[Warning] FG-Anchor-Vote Loss skipped at iter {iteration}: {e}")
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        # 4. Anchor-level Soft Foreground Curve Loss (exp08)
+        #    与 hard FG voting 互斥；若 anchor_soft_enable=True 则启用 soft，忽略 hard。
+        if getattr(opt, "anchor_soft_enable", False) and gt_mask is not None:
+            try:
+                as_weight = float(getattr(opt, "anchor_soft_weight", 0.002))
+                as_start = int(getattr(opt, "anchor_soft_start_iter", 5000))
+                as_ramp = int(getattr(opt, "anchor_soft_ramp", 1000))
+                as_decay_start = int(getattr(opt, "anchor_soft_decay_start", 10000))
+                as_decay_end = int(getattr(opt, "anchor_soft_decay_end", 15000))
+                as_tau = float(getattr(opt, "anchor_soft_tau", 0.35))
+                as_temp = float(getattr(opt, "anchor_soft_temp", 0.10))
+                as_min_ratio = float(getattr(opt, "anchor_soft_min_ratio", 0.10))
+                as_max_samples = int(getattr(opt, "anchor_soft_max_samples", 4096))
+                as_detach_xyz = bool(getattr(opt, "anchor_soft_detach_xyz", True))
+
+                # Time weight: 0 -> ramp up -> 1 -> decay -> 0
+                if iteration < as_start:
+                    time_weight = 0.0
+                elif iteration < as_start + as_ramp:
+                    time_weight = (iteration - as_start) / max(as_ramp, 1)
+                elif iteration < as_decay_start:
+                    time_weight = 1.0
+                elif iteration < as_decay_end:
+                    time_weight = 1.0 - (iteration - as_decay_start) / max(as_decay_end - as_decay_start, 1)
+                else:
+                    time_weight = 0.0
+
+                if time_weight > 0.0:
+                    neural_xyz = render_pkg.get("neural_xyz")
+                    neural_seg_logits = render_pkg.get("neural_seg_logits")
+                    neural_opacity_filtered = render_pkg.get("neural_opacity_filtered")
+                    neural_anchor_idx = render_pkg.get("neural_anchor_idx")
+
+                    if (neural_xyz is not None and neural_seg_logits is not None and
+                        neural_opacity_filtered is not None and neural_anchor_idx is not None):
+                        loss_as, as_info = compute_anchor_fg_soft_curve_loss(
+                            xyz=neural_xyz,
+                            seg_logits=neural_seg_logits,
+                            opacity=neural_opacity_filtered,
+                            anchor_idx=neural_anchor_idx,
+                            viewpoint_cam=viewpoint_cam,
+                            gt_mask=gt_mask,
+                            tau=as_tau,
+                            temp=as_temp,
+                            min_ratio=as_min_ratio,
+                            max_samples=as_max_samples,
+                            detach_xyz=as_detach_xyz,
+                        )
+
+                        total_w = as_weight * time_weight
+                        if total_w > 0.0 and loss_as.item() > 0.0:
+                            loss = loss + total_w * loss_as
+
+                        if iteration % 100 == 0:
+                            sel_count = as_info.get("selected_count", 0)
+                            fg_ratio_mean = as_info.get("fg_ratio_mean", 0.0)
+                            soft_w_mean = as_info.get("soft_weight_mean", 0.0)
+                            pred_fg_mean = as_info.get("pred_fg_mean", 0.0)
+                            as_loss_val = as_info.get("anchor_soft_loss", 0.0)
+                            print(
+                                f"Iter {iteration}: Anchor-Soft Loss={as_loss_val:.5f} "
+                                f"time_w={time_weight:.4f} total_w={total_w:.6f} "
+                                f"selected_count={sel_count} fg_ratio_mean={fg_ratio_mean:.3f} "
+                                f"soft_weight_mean={soft_w_mean:.3f} pred_fg_mean={pred_fg_mean:.3f}"
+                            )
+            except Exception as e:
+                print(f"[Warning] Anchor-Soft-Curve Loss skipped at iter {iteration}: {e}")
                 try:
                     torch.cuda.empty_cache()
                 except Exception:

@@ -233,6 +233,18 @@ class OptimizationParams(ParamGroup):
         self.anchor_fg_detach_xyz = True
         self.anchor_fg_ramp = 1000
 
+        # --- Anchor-level Soft Foreground Curve (exp08) ---
+        self.anchor_soft_enable = False
+        self.anchor_soft_weight = 0.002
+        self.anchor_soft_tau = 0.35
+        self.anchor_soft_temp = 0.10
+        self.anchor_soft_min_ratio = 0.10
+        self.anchor_soft_start_iter = 5000
+        self.anchor_soft_ramp = 1000
+        self.anchor_soft_decay_start = 10000
+        self.anchor_soft_decay_end = 15000
+        self.anchor_soft_max_samples = 4096
+
         # Two-stage training: only optimize segmentation head
         self.seg_only = False
         # Two-stage 模式下保留原始 seg head 权重（不重新初始化深层 MLP）
