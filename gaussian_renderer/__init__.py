@@ -199,9 +199,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # [关键改进 v5] 使用 semantic_feature 通道直接渲染 mask，不再需要复制3通道的 hack。
     # segmentation: [M, 1] (binary) or [M, num_classes] (multi-class)
-    # 对于 binary，保持 [M, 1]；对于 multi-class，seg MLP 输出 [M, C] 后直接传入。
-    # 注意：rasterizer 要求 semantic_feature 维度 <= NUM_SEMANTIC_CHANNELS (128)。
-    seg_feature = segmentation  # [M, 1] or [M, C]
+    # CUDA rasterizer 要求 semantic_feature 的通道数必须严格等于 NUM_SEMANTIC_CHANNELS (128)，
+    # 因此需要将 [M, C] pad 到 [M, 128]，渲染后再切回前 C 个通道。
+    NUM_SEMANTIC_CHANNELS = 128
+    seg_feature = segmentation  # [M, C]
+    if seg_feature.shape[1] < NUM_SEMANTIC_CHANNELS:
+        pad = torch.zeros(seg_feature.shape[0], NUM_SEMANTIC_CHANNELS - seg_feature.shape[1],
+                          device=seg_feature.device, dtype=seg_feature.dtype)
+        seg_feature = torch.cat([seg_feature, pad], dim=1)
     # [关键改进 v4] 只 detach opacity：
     # 切断 mask loss → opacity → mlp_opacity → feat → RGB 的主要冲突路径。
     # 保留 xyz/scaling/rotation 的梯度，让 mask 仍可通过调整位置/大小来对齐 GT。

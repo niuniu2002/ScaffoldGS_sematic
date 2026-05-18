@@ -450,8 +450,11 @@ renderCUDA(
 			float w = alpha * T;
 			D += depp * w;
 
-			for (int ch = 0; ch < NUM_SEMANTIC_CHANNELS; ch++)
-				SF[ch] += semantic_feature[collected_id[j] * NUM_SEMANTIC_CHANNELS + ch] * alpha * T;
+			if (semantic_feature != nullptr)
+			{
+				for (int ch = 0; ch < NUM_SEMANTIC_CHANNELS; ch++)
+					SF[ch] += semantic_feature[collected_id[j] * NUM_SEMANTIC_CHANNELS + ch] * alpha * T;
+			}
 
 			T = test_T;
 
