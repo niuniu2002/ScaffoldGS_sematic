@@ -136,12 +136,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             if mask_pil.size != image.size:
                 mask_pil = mask_pil.resize(image.size, Image.NEAREST)
 
-            # 转 Tensor 并归一化 (H, W, 1) -> (1, H, W)
+            # 转 Tensor 并保持原始整数值 (H, W) -> (1, H, W)
+            # 对于二分类 mask (0/255)，后续在 train.py 中按需除以 255
+            # 对于多分类 mask (0,1,2,...)，直接作为类别标签使用
             loaded_mask_np = np.array(mask_pil)
             loaded_mask = torch.from_numpy(loaded_mask_np)
             if len(loaded_mask.shape) == 3:
                 loaded_mask = loaded_mask[:, :, 0]  # 取单通道
-            loaded_mask = loaded_mask.unsqueeze(0).float() / 255.0
+            loaded_mask = loaded_mask.unsqueeze(0).long()
 
         # -------------------------
         # 读取语义权重图（可选）

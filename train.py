@@ -73,6 +73,25 @@ def dice_loss(pred: torch.Tensor,
     return 1.0 - dice
 
 
+def multiclass_dice_loss(pred_probs: torch.Tensor,
+                         target: torch.Tensor,
+                         num_classes: int,
+                         smooth: float = 1.0) -> torch.Tensor:
+    """Multi-class Dice loss.
+
+    Args:
+        pred_probs: [C, H, W] softmax probabilities
+        target: [H, W] long class indices
+        num_classes: number of classes
+        smooth: Laplace smoothing
+    """
+    target_one_hot = torch.nn.functional.one_hot(target.long(), num_classes).permute(2, 0, 1).float()
+    intersection = (pred_probs * target_one_hot).sum(dim=(1, 2))
+    union = pred_probs.sum(dim=(1, 2)) + target_one_hot.sum(dim=(1, 2))
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return 1.0 - dice.mean()
+
+
 def focal_loss(pred: torch.Tensor,
                target: torch.Tensor,
                alpha: float = 0.25,
@@ -430,7 +449,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
-                              use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False))
+                              use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False),
+                              num_classes=getattr(dataset, 'num_classes', 1))
     # 如果提供了 load_iteration，则从对应的 point_cloud/iteration_X 加载已有高斯作为初始化
     scene = Scene(dataset, gaussians, load_iteration=load_iteration, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
@@ -567,89 +587,94 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         semantic_phase_iter = iteration - start_semantic_iter  # 0 at first semantic iteration
         
         if semantic_enabled and pred_mask is not None and gt_mask is not None:
-            # [王子殿下专属修正] 
-            # 加上 epsilon (1e-6) 防止 pred_mask 为 0 时 log(0) 导致 Loss=NaN
-            pred_mask_clamped = torch.clamp(pred_mask, min=1e-6, max=1.0-1e-6)
-            
-            # 确保 gt_mask 也是 float 类型以便计算 loss
-            gt_mask_float = gt_mask.float()
+            num_classes = gaussians.num_classes
+            dice_weight = float(getattr(opt, "dice_weight", 1.0))
+            seg_w = float(getattr(opt, "mask_weight", 0.0)) * _ramp_factor(
+                semantic_phase_iter,
+                int(getattr(opt, "mask_warmup", 0)),
+                int(getattr(opt, "mask_ramp", 0)),
+            )
 
-            if pred_mask_clamped.shape == gt_mask_float.shape:
-                # Uncertainty-aware pixel weighting (edge-robust):
-                # gt close to 0.5 => very low weight; gt close to 0/1 => weight -> 1.0
-                conf = torch.clamp(torch.abs(gt_mask_float - 0.5) * 2.0, 0.0, 1.0)
-                uncertainty_min = float(getattr(opt, "uncertainty_min", 0.1))
-                uncertainty_power = float(getattr(opt, "uncertainty_power", 2.0))
-                uncertainty_weight = uncertainty_min + (1.0 - uncertainty_min) * torch.pow(conf, uncertainty_power)
+            if num_classes == 1:
+                # ========== Binary Segmentation (sigmoid + focal + dice) ==========
+                pred_mask_clamped = torch.clamp(pred_mask, min=1e-6, max=1.0-1e-6)
+                gt_mask_float = gt_mask.float()
+                if gt_mask_float.max() > 1.0:
+                    gt_mask_float = gt_mask_float / 255.0
 
-                # [新增] 语义权重图加权（Semantic Weight Map）
-                sem_weight_map = viewpoint_cam.semantic_weight if hasattr(viewpoint_cam, 'semantic_weight') else None
-                if getattr(opt, 'use_semantic_weight', False) and sem_weight_map is not None:
-                    sem_w = sem_weight_map.cuda().float()
-                    # 语义权重图: 像素值表示外部模型对该像素的置信度
-                    # 0.5 为决策边界，越接近 0 或 1 越确定
-                    abs_conf = torch.abs(sem_w - 0.5) * 2.0  # [0, 1], 1=最确定
+                if pred_mask_clamped.shape == gt_mask_float.shape:
+                    # Uncertainty-aware pixel weighting (edge-robust)
+                    conf = torch.clamp(torch.abs(gt_mask_float - 0.5) * 2.0, 0.0, 1.0)
+                    uncertainty_min = float(getattr(opt, "uncertainty_min", 0.1))
+                    uncertainty_power = float(getattr(opt, "uncertainty_power", 2.0))
+                    uncertainty_weight = uncertainty_min + (1.0 - uncertainty_min) * torch.pow(conf, uncertainty_power)
 
-                    strategy = getattr(opt, 'sem_weight_strategy', 'hard')
-                    if strategy == 'hard':
-                        high_t = float(getattr(opt, 'sem_weight_high', 0.7))
-                        low_t = float(getattr(opt, 'sem_weight_low', 0.1))
-                        boost = float(getattr(opt, 'sem_weight_boost', 2.0))
-                        sem_pixel_weight = torch.zeros_like(abs_conf)
-                        sem_pixel_weight[abs_conf >= high_t] = 1.0
-                        sem_pixel_weight[(abs_conf >= low_t) & (abs_conf < high_t)] = boost
-                        # abs_conf < low_t 保持 0（忽略）
-                    elif strategy == 'conservative_hard':
-                        high_t = float(getattr(opt, 'sem_weight_high', 0.7))
-                        boost = float(getattr(opt, 'sem_weight_boost', 2.0))
-                        # [实验4] 保守策略: 不忽略任何像素, 低置信度保持1.0, 高置信度增强
-                        sem_pixel_weight = torch.ones_like(abs_conf)
-                        sem_pixel_weight[abs_conf >= high_t] = boost
-                    else:  # smooth
-                        peak = float(getattr(opt, 'sem_weight_smooth_peak', 0.5))
-                        # 倒抛物线: 在 peak 处权重最大
-                        denom = peak if peak > 1e-6 else 1e-6
-                        sem_pixel_weight = 1.0 - 4.0 * ((abs_conf - peak) / denom) ** 2
-                        sem_pixel_weight = torch.clamp(sem_pixel_weight, min=0.0)
-                        # 高置信度区域保底权重 1.0
-                        high_t = float(getattr(opt, 'sem_weight_high', 0.7))
-                        sem_pixel_weight = torch.where(abs_conf >= high_t, torch.ones_like(sem_pixel_weight), sem_pixel_weight)
+                    # Semantic weight map
+                    sem_weight_map = viewpoint_cam.semantic_weight if hasattr(viewpoint_cam, 'semantic_weight') else None
+                    if getattr(opt, 'use_semantic_weight', False) and sem_weight_map is not None:
+                        sem_w = sem_weight_map.cuda().float()
+                        abs_conf = torch.abs(sem_w - 0.5) * 2.0
+                        strategy = getattr(opt, 'sem_weight_strategy', 'hard')
+                        if strategy == 'hard':
+                            high_t = float(getattr(opt, 'sem_weight_high', 0.7))
+                            low_t = float(getattr(opt, 'sem_weight_low', 0.1))
+                            boost = float(getattr(opt, 'sem_weight_boost', 2.0))
+                            sem_pixel_weight = torch.zeros_like(abs_conf)
+                            sem_pixel_weight[abs_conf >= high_t] = 1.0
+                            sem_pixel_weight[(abs_conf >= low_t) & (abs_conf < high_t)] = boost
+                        elif strategy == 'conservative_hard':
+                            high_t = float(getattr(opt, 'sem_weight_high', 0.7))
+                            boost = float(getattr(opt, 'sem_weight_boost', 2.0))
+                            sem_pixel_weight = torch.ones_like(abs_conf)
+                            sem_pixel_weight[abs_conf >= high_t] = boost
+                        else:  # smooth
+                            peak = float(getattr(opt, 'sem_weight_smooth_peak', 0.5))
+                            denom = peak if peak > 1e-6 else 1e-6
+                            sem_pixel_weight = 1.0 - 4.0 * ((abs_conf - peak) / denom) ** 2
+                            sem_pixel_weight = torch.clamp(sem_pixel_weight, min=0.0)
+                            high_t = float(getattr(opt, 'sem_weight_high', 0.7))
+                            sem_pixel_weight = torch.where(abs_conf >= high_t, torch.ones_like(sem_pixel_weight), sem_pixel_weight)
+                        uncertainty_weight = uncertainty_weight * sem_pixel_weight
 
-                    # 将语义权重与现有 uncertainty_weight 相乘（叠加外部先验）
-                    uncertainty_weight = uncertainty_weight * sem_pixel_weight
-
+                    raw_loss = focal_loss(
+                        pred_mask_clamped, gt_mask_float,
+                        alpha=float(getattr(opt, "focal_alpha", 0.25)),
+                        gamma=float(getattr(opt, "focal_gamma", 2.0)),
+                        reduction='none',
+                    )
+                    loss_focal = (raw_loss * uncertainty_weight).mean()
+                    loss_dice = dice_loss(pred_mask_clamped, gt_mask_float, smooth=1.0)
+                    loss_seg = loss_focal + dice_weight * loss_dice
+                    if seg_w > 0:
+                        loss = loss + seg_w * loss_seg
                     if iteration % 100 == 0:
-                        active_ratio = (sem_pixel_weight > 0).float().mean().item()
-                        boost_ratio = (sem_pixel_weight > 1.0).float().mean().item()
-                        print(f"Iter {iteration}: SemanticWeight active={active_ratio:.2%} boost={boost_ratio:.2%}")
+                        print(f"Iter {iteration}: Mask Loss = {loss_seg.item():.5f} (focal={loss_focal.item():.5f}, dice={loss_dice.item():.5f}, w={seg_w:.4f})")
+            else:
+                # ========== Multi-class Segmentation (softmax + CE + dice) ==========
+                # pred_mask: [C, H, W] logits from rasterizer
+                # gt_mask:  [1, H, W] or [H, W] long class indices
+                gt_labels = gt_mask.squeeze(0).long()  # [H, W]
+                if gt_labels.max() > num_classes - 1:
+                    # Fallback: 0/255 format for binary-like masks mapped to multi-class
+                    gt_labels = (gt_labels > 0).long()
 
-                # Pixel-wise focal loss (handles class imbalance)
-                raw_loss = focal_loss(
-                    pred_mask_clamped,
-                    gt_mask_float,
-                    alpha=float(getattr(opt, "focal_alpha", 0.25)),
-                    gamma=float(getattr(opt, "focal_gamma", 2.0)),
-                    reduction='none',
+                pred_logits = pred_mask  # [C, H, W]
+
+                # Cross-entropy (pixel-wise, then mean)
+                ce = torch.nn.functional.cross_entropy(
+                    pred_logits.unsqueeze(0), gt_labels.unsqueeze(0), reduction='none'
                 )
-                loss_focal = (raw_loss * uncertainty_weight).mean()
+                loss_ce = ce.mean()
 
-                # Dice loss (complements focal loss for small foreground regions)
-                loss_dice = dice_loss(pred_mask_clamped, gt_mask_float, smooth=1.0)
+                # Multi-class dice
+                pred_probs = torch.nn.functional.softmax(pred_logits, dim=0)
+                loss_dice = multiclass_dice_loss(pred_probs, gt_labels, num_classes, smooth=1.0)
 
-                # Combined: focal + dice (equal weighting by default)
-                dice_weight = float(getattr(opt, "dice_weight", 1.0))
-                loss_seg = loss_focal + dice_weight * loss_dice
-
-                seg_w = float(getattr(opt, "mask_weight", 0.0)) * _ramp_factor(
-                    semantic_phase_iter,
-                    int(getattr(opt, "mask_warmup", 0)),
-                    int(getattr(opt, "mask_ramp", 0)),
-                )
+                loss_seg = loss_ce + dice_weight * loss_dice
                 if seg_w > 0:
                     loss = loss + seg_w * loss_seg
-
                 if iteration % 100 == 0:
-                    print(f"Iter {iteration}: Mask Loss = {loss_seg.item():.5f} (focal={loss_focal.item():.5f}, dice={loss_dice.item():.5f}, w={seg_w:.4f})")
+                    print(f"Iter {iteration}: Mask Loss = {loss_seg.item():.5f} (ce={loss_ce.item():.5f}, dice={loss_dice.item():.5f}, w={seg_w:.4f})")
 
         # 2. KNN Consistency Loss (权重可配置 + 硬性语义预热 + 可升温 + 可调频率)
         knn_every = int(getattr(opt, "knn_every", 0))
@@ -704,19 +729,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 neighbor_inds = topk_inds[:, 1:]
                                 neighbor_logit = anchor_seg_logit[neighbor_inds]
 
-                                # [改进 v2] 概率空间对称 BCE KNN：
-                                # 数值范围可控，不会推向 0.5，而是强制相邻 anchor 趋向一致（都 0 或都 1）
-                                sample_prob = torch.sigmoid(sample_logit).unsqueeze(1)      # [n_samples, 1]
-                                neighbor_prob = torch.sigmoid(neighbor_logit)               # [n_samples, k-1]
-                                eps = 1e-6
-                                # 对称 BCE = [BCE(p_i||p_j) + BCE(p_j||p_i)] / 2
-                                loss_knn = -0.5 * (
-                                    sample_prob * torch.log(neighbor_prob + eps)
-                                    + (1.0 - sample_prob) * torch.log(1.0 - neighbor_prob + eps)
-                                    + neighbor_prob * torch.log(sample_prob + eps)
-                                    + (1.0 - neighbor_prob) * torch.log(1.0 - sample_prob + eps)
-                                )
-                                loss_knn = loss_knn.mean()
+                                num_classes_knn = gaussians.num_classes
+                                if num_classes_knn == 1:
+                                    # [改进 v2] 概率空间对称 BCE KNN（二分类）
+                                    sample_prob = torch.sigmoid(sample_logit).unsqueeze(1)      # [n_samples, 1]
+                                    neighbor_prob = torch.sigmoid(neighbor_logit)               # [n_samples, k-1]
+                                    eps = 1e-6
+                                    loss_knn = -0.5 * (
+                                        sample_prob * torch.log(neighbor_prob + eps)
+                                        + (1.0 - sample_prob) * torch.log(1.0 - neighbor_prob + eps)
+                                        + neighbor_prob * torch.log(sample_prob + eps)
+                                        + (1.0 - neighbor_prob) * torch.log(1.0 - sample_prob + eps)
+                                    )
+                                    loss_knn = loss_knn.mean()
+                                    knn_loss_name = "KNN(BCE)"
+                                else:
+                                    # 多分类 KNN：softmax 分布间的 MSE
+                                    sample_prob = torch.nn.functional.softmax(sample_logit, dim=-1).unsqueeze(1)   # [n_samples, 1, C]
+                                    neighbor_prob = torch.nn.functional.softmax(neighbor_logit, dim=-1)              # [n_samples, k-1, C]
+                                    loss_knn = torch.nn.functional.mse_loss(sample_prob.expand_as(neighbor_prob), neighbor_prob)
+                                    knn_loss_name = "KNN(MSE)"
 
                                 knn_w = float(getattr(opt, "knn_weight", 0.0)) * _ramp_factor(
                                     semantic_phase_iter,
@@ -726,7 +758,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 if knn_w > 0:
                                     loss = loss + knn_w * loss_knn
 
-                                print(f"Iter {iteration}: KNN(BCE) Loss = {loss_knn.item():.6f} (w={knn_w:.4f}, every={knn_every}, offset={knn_offset})")
+                                print(f"Iter {iteration}: {knn_loss_name} Loss = {loss_knn.item():.6f} (w={knn_w:.4f}, every={knn_every}, offset={knn_offset})")
 
                             # 及时清理中间变量并释放显存
                             del dists, topk_inds, topk_val, dists_chunks
@@ -764,7 +796,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         do_ar = (ar_weight > 0.0) and (iteration >= ar_start) and ((iteration - ar_start) % ar_every == 0)
 
-        if do_ar and gt_mask is not None:
+        # Anchor voting losses are currently designed for binary segmentation only
+        if do_ar and gt_mask is not None and gaussians.num_classes == 1:
             try:
                 neural_xyz = render_pkg.get("neural_xyz")
                 neural_seg_logits = render_pkg.get("neural_seg_logits")
@@ -815,7 +848,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         # 4. Anchor-level Soft Foreground Curve Loss (exp08)
         #    与 hard FG voting 互斥；若 anchor_soft_enable=True 则启用 soft，忽略 hard。
-        if getattr(opt, "anchor_soft_enable", False) and gt_mask is not None:
+        #    当前仅支持二分类。
+        if getattr(opt, "anchor_soft_enable", False) and gt_mask is not None and gaussians.num_classes == 1:
             try:
                 as_weight = float(getattr(opt, "anchor_soft_weight", 0.002))
                 as_start = int(getattr(opt, "anchor_soft_start_iter", 5000))
@@ -1101,7 +1135,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank,
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
-                              use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False))
+                              use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False),
+                              num_classes=getattr(dataset, 'num_classes', 1))
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 

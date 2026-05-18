@@ -89,8 +89,9 @@ class ModelParams(ParamGroup):
         self.ds = 1
         self.ratio = 1 # sampling the input point cloud
         self.undistorted = False
-        self.use_per_gaussian_seg = False 
-        
+        self.use_per_gaussian_seg = False
+        self.num_classes = 1  # 1=binary(sigmoid), >=2=multi-class(softmax)
+
         # In the Bungeenerf dataset, we propose to set the following three parameters to True,
         # Because there are enough dist variations.
         self.add_opacity_dist = False

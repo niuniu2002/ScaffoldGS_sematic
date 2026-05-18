@@ -31,10 +31,11 @@ def main():
         exp_name = os.path.basename(exp_dir)
         cfg_path = os.path.join(exp_dir, "cfg_args")
 
-        # Read cfg_args for white_background, appearance_dim, use_per_gaussian_seg
+        # Read cfg_args for white_background, appearance_dim, use_per_gaussian_seg, num_classes
         white_background = False
         appearance_dim = 32
         use_per_gaussian_seg = False
+        num_classes = 1
         if os.path.exists(cfg_path):
             with open(cfg_path) as f:
                 content = f.read()
@@ -47,9 +48,12 @@ def main():
                 m = re.search(r"appearance_dim=(\d+)", content)
                 if m:
                     appearance_dim = int(m.group(1))
+                m = re.search(r"num_classes=(\d+)", content)
+                if m:
+                    num_classes = int(m.group(1))
 
         print(f"\n>>> {exp_name}")
-        print(f"    white_background={white_background}, appearance_dim={appearance_dim}, use_per_gaussian_seg={use_per_gaussian_seg}")
+        print(f"    white_background={white_background}, appearance_dim={appearance_dim}, use_per_gaussian_seg={use_per_gaussian_seg}, num_classes={num_classes}")
 
         exp_results = {"exp": exp_name}
 
@@ -63,6 +67,7 @@ def main():
                     white_background=white_background,
                     appearance_dim=appearance_dim,
                     use_per_gaussian_seg=use_per_gaussian_seg,
+                    num_classes=num_classes,
                 )
                 exp_results[f"{dataset_name}_miou"] = mean_miou
                 exp_results[f"{dataset_name}_psnr"] = mean_psnr

@@ -27,7 +27,7 @@ from scene.embedding import Embedding
 
 
 class SegmentationHead(nn.Module):
-    """更深的分割头，带残差连接和 LayerNorm。"""
+    """更深的分割头，带残差连接和 LayerNorm。支持二分类(sigmoid)和多分类(softmax)。"""
     def __init__(self, feat_dim=32, hidden_dim=128, num_layers=3, dropout=0.0, num_outputs=1):
         super().__init__()
         self.input_proj = nn.Linear(feat_dim, hidden_dim)
@@ -41,6 +41,7 @@ class SegmentationHead(nn.Module):
                 nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             ))
         self.logit_head = nn.Linear(hidden_dim, num_outputs)
+        self.num_outputs = num_outputs
 
     def forward(self, x, return_logit=False):
         feat = self.input_proj(x)
@@ -51,7 +52,9 @@ class SegmentationHead(nn.Module):
         logit = self.logit_head(feat)
         if return_logit:
             return logit
-        return torch.sigmoid(logit)
+        if self.num_outputs == 1:
+            return torch.sigmoid(logit)
+        return torch.softmax(logit, dim=-1)
 
 
 class GaussianModel:
@@ -88,11 +91,13 @@ class GaussianModel:
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
                  use_per_gaussian_seg : bool = False,
+                 num_classes : int = 1,
                  ):
 
         self.feat_dim = feat_dim
         self.n_offsets = n_offsets
         self.use_per_gaussian_seg = use_per_gaussian_seg
+        self.num_classes = num_classes
         self.voxel_size = voxel_size
         self.update_depth = update_depth
         self.update_init_factor = update_init_factor
@@ -160,7 +165,11 @@ class GaussianModel:
         ).cuda()
 
         # [改进] 更深的语义分割头（3层残差，128 hidden）
-        seg_outputs = self.n_offsets if self.use_per_gaussian_seg else 1
+        # 多分类支持：per-anchor 输出 num_classes；per-Gaussian 输出 num_classes * n_offsets
+        if self.use_per_gaussian_seg:
+            seg_outputs = self.num_classes * self.n_offsets
+        else:
+            seg_outputs = self.num_classes
         self.mlp_segmentation = SegmentationHead(
             feat_dim=self.feat_dim,
             hidden_dim=128,
@@ -274,33 +283,47 @@ class GaussianModel:
     def get_anchor_seg_logits(self):
         """
         供 train.py 中的 KNN Loss 调用。
-        返回每个锚点的分割预测概率值 [0,1]。
+        返回每个锚点的分割预测概率。
+        - 二分类(num_classes=1): [N]
+        - 多分类(num_classes>=2): [N, num_classes]
         若使用 per-Gaussian seg，则对 offsets 取平均后返回。
         """
         feat = self._anchor_feat.detach()
-        seg = self.mlp_segmentation(feat)  # [N, 1] or [N, n_offsets]
-        if self.use_per_gaussian_seg and seg.dim() == 2 and seg.shape[1] > 1:
-            seg = seg.mean(dim=1, keepdim=True)
-        return seg.squeeze(-1)
+        seg = self.mlp_segmentation(feat)
+        if self.use_per_gaussian_seg and seg.dim() == 2 and seg.shape[1] > self.num_classes:
+            # [N, num_classes * n_offsets] -> [N, n_offsets, num_classes] -> mean -> [N, num_classes]
+            seg = seg.view(-1, self.n_offsets, self.num_classes).mean(dim=1)
+        if self.num_classes == 1:
+            seg = seg.squeeze(-1)
+        return seg
 
     def get_anchor_seg_logits_raw(self):
         """
-        [改进] 返回 Sigmoid 之前的 logit 值，供 logit-space KNN Loss 使用。
+        [改进] 返回激活函数之前的 logit / log-probability 值，供 KNN Loss 使用。
+        - 二分类(num_classes=1): [N]
+        - 多分类(num_classes>=2): [N, num_classes]
         若使用 per-Gaussian seg，则对 offsets 取平均后返回。
-        
+
         兼容 JIT traced 模型：JIT trace 只捕获默认 forward 路径，
-        不支持 return_logit 参数，此时通过 sigmoid 输出反推 logit。
+        不支持 return_logit 参数，此时通过概率输出反推 logit/log-prob。
         """
         feat = self._anchor_feat.detach()
         if getattr(self, 'mlp_segmentation_is_jit', False):
-            # JIT traced 模型不支持 return_logit，fallback 到 sigmoid -> logit
+            # JIT traced 模型不支持 return_logit，fallback 到概率 -> logit
             seg = self.mlp_segmentation(feat)
-            logit = torch.logit(seg.clamp(min=1e-7, max=1-1e-7))
+            if self.use_per_gaussian_seg and seg.dim() == 2 and seg.shape[1] > self.num_classes:
+                seg = seg.view(-1, self.n_offsets, self.num_classes).mean(dim=1)
+            if self.num_classes == 1:
+                logit = torch.logit(seg.clamp(min=1e-7, max=1-1e-7))
+            else:
+                logit = torch.log(seg.clamp(min=1e-7))
         else:
-            logit = self.mlp_segmentation(feat, return_logit=True)  # [N, 1] or [N, n_offsets]
-        if self.use_per_gaussian_seg and logit.dim() == 2 and logit.shape[1] > 1:
-            logit = logit.mean(dim=1, keepdim=True)
-        return logit.squeeze(-1)
+            logit = self.mlp_segmentation(feat, return_logit=True)
+            if self.use_per_gaussian_seg and logit.dim() == 2 and logit.shape[1] > self.num_classes:
+                logit = logit.view(-1, self.n_offsets, self.num_classes).mean(dim=1)
+        if self.num_classes == 1:
+            logit = logit.squeeze(-1)
+        return logit
     
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)

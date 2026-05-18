@@ -62,7 +62,8 @@ def evaluate_with_tta(model_path, source_path, iteration,
         args.feat_dim, args.n_offsets, args.voxel_size,
         args.update_depth, args.update_init_factor, args.update_hierachy_factor,
         args.use_feat_bank, args.appearance_dim, args.ratio,
-        args.add_opacity_dist, args.add_cov_dist, args.add_color_dist
+        args.add_opacity_dist, args.add_cov_dist, args.add_color_dist,
+        num_classes=getattr(args, 'num_classes', 1)
     )
     scene = Scene(args, gaussians, load_iteration=iteration, shuffle=False)
 

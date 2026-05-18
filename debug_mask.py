@@ -12,7 +12,7 @@ parser = argparse.ArgumentParser()
 ModelParams(parser)
 args = parser.parse_args(['--source_path', 'data/dronev4_2', '--model_path', 'output/dronev4_2', '--eval', '--appearance_dim', '0'])
 
-gaussians = GaussianModel(args.feat_dim, args.n_offsets, args.voxel_size, args.update_depth, args.update_init_factor, args.update_hierachy_factor, args.use_feat_bank, args.appearance_dim, args.ratio, args.add_opacity_dist, args.add_cov_dist, args.add_color_dist)
+gaussians = GaussianModel(args.feat_dim, args.n_offsets, args.voxel_size, args.update_depth, args.update_init_factor, args.update_hierachy_factor, args.use_feat_bank, args.appearance_dim, args.ratio, args.add_opacity_dist, args.add_cov_dist, args.add_color_dist, num_classes=getattr(args, 'num_classes', 1))
 
 # Monkey-patch to skip automatic mlp loading
 gaussians.load_mlp_checkpoints = lambda *a, **k: None

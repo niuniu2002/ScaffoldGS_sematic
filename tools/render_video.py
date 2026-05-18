@@ -128,7 +128,7 @@ def render_video_path(dataset, iteration, pipeline, args):
 								dataset.update_depth, dataset.update_init_factor, 
 								dataset.update_hierachy_factor, dataset.use_feat_bank, 
 								dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, 
-								dataset.add_cov_dist, dataset.add_color_dist)
+								dataset.add_cov_dist, dataset.add_color_dist, num_classes=getattr(dataset, 'num_classes', 1))
         
 		scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 		# 使用 eval 加载权重，然后切换到 train 模式以启用语义 mask 渲染

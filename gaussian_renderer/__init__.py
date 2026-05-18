@@ -48,8 +48,11 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # per-anchor segmentation confidence
     # Detach to avoid segmentation supervision pulling shared features (which can hurt RGB reconstruction).
-    segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, 1] or [N, K], sigmoid output
-    segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+    segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, num_classes] or [N, num_classes*K]
+    if pc.num_classes == 1:
+        segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+    else:
+        segmentation_anchor_logit = pc.mlp_segmentation(feat.detach(), return_logit=True)
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
@@ -95,12 +98,18 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = grid_offsets.view([-1, 3]) # [mask]
 
     # expand per-anchor segmentation to per-Gaussian
+    num_seg_ch = pc.num_classes if pc.num_classes > 1 else 1
     if pc.use_per_gaussian_seg:
-        segmentation_all = segmentation_anchor.view(-1, 1)       # [N*k, 1]
-        seg_logits_all = segmentation_anchor_logit.view(-1, 1)   # [N*k, 1]
+        if pc.num_classes > 1:
+            # [N, num_classes*n_offsets] -> [N, n_offsets, num_classes] -> [N*k, num_classes]
+            segmentation_all = segmentation_anchor.view(anchor.shape[0], pc.n_offsets, pc.num_classes).view(-1, pc.num_classes)
+            seg_logits_all = segmentation_anchor_logit.view(anchor.shape[0], pc.n_offsets, pc.num_classes).view(-1, pc.num_classes)
+        else:
+            segmentation_all = segmentation_anchor.view(-1, 1)       # [N*k, 1]
+            seg_logits_all = segmentation_anchor_logit.view(-1, 1)   # [N*k, 1]
     else:
-        segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)       # [N*k, 1]
-        seg_logits_all = segmentation_anchor_logit.repeat_interleave(pc.n_offsets, dim=0)   # [N*k, 1]
+        segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)       # [N*k, C]
+        seg_logits_all = segmentation_anchor_logit.repeat_interleave(pc.n_offsets, dim=0)   # [N*k, C]
 
     # anchor index for each child Gaussian (before opacity masking)
     anchor_idx_all = torch.arange(anchor.shape[0], device=anchor.device).repeat_interleave(pc.n_offsets)  # [N*k]
@@ -110,7 +119,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
     concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, segmentation_all], dim=-1)
     masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets, segmentation = masked.split([6, 3, 3, 7, 3, 1], dim=-1)
+    seg_ch = pc.num_classes if pc.num_classes > 1 else 1
+    scaling_repeat, repeat_anchor, color, scale_rot, offsets, segmentation = masked.split([6, 3, 3, 7, 3, seg_ch], dim=-1)
     
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) 
@@ -199,10 +209,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # [关键改进 v5] 使用 semantic_feature 通道直接渲染 mask，不再需要复制3通道的 hack。
     # segmentation: [M, 1] (binary) or [M, num_classes] (multi-class)
+    # 多分类时：rasterizer 传入 logit（保证 alpha-blend 后 softmax 有意义），
+    # 二分类时：保持传入 probability（与现有 BCE/focal loss 兼容）。
     # CUDA rasterizer 要求 semantic_feature 的通道数必须严格等于 NUM_SEMANTIC_CHANNELS (128)，
     # 因此需要将 [M, C] pad 到 [M, 128]，渲染后再切回前 C 个通道。
     NUM_SEMANTIC_CHANNELS = 128
-    seg_feature = segmentation  # [M, C]
+    if pc.num_classes == 1:
+        seg_feature = segmentation  # [M, 1] probabilities
+    else:
+        seg_feature = seg_logits_masked  # [M, C] logits
     if seg_feature.shape[1] < NUM_SEMANTIC_CHANNELS:
         pad = torch.zeros(seg_feature.shape[0], NUM_SEMANTIC_CHANNELS - seg_feature.shape[1],
                           device=seg_feature.device, dtype=seg_feature.dtype)
