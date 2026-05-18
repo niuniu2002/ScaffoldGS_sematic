@@ -166,7 +166,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     
     # Rasterize visible Gaussians to image
-    rendered_image, radii = rasterizer(
+    # [Feature-3DGS rasterizer] returns (color, feature_map, radii, depth)
+    rendered_image, _, radii, _ = rasterizer(
         means3D = xyz,
         means2D = screenspace_points,
         shs = None,
@@ -179,6 +180,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # [修改点3] 强制执行语义掩码光栅化 (移除 if is_training 判断)
     # NOTE: Mask pass uses a black background so pixels with no Gaussian coverage
     # render to 0 (matches typical GT masks), independent of dataset white_background.
+    # [Feature-3DGS rasterizer] semantic_feature is rendered via its own multi-channel path.
     raster_settings_mask = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -195,27 +197,36 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
     rasterizer_mask = GaussianRasterizer(raster_settings=raster_settings_mask)
 
-    # segmentation: [N_visible_gaussians, 1] -> fake 3-channel features for rasterizer
-    seg_features = segmentation.repeat(1, 3)
+    # [关键改进 v5] 使用 semantic_feature 通道直接渲染 mask，不再需要复制3通道的 hack。
+    # segmentation: [M, 1] (binary) or [M, num_classes] (multi-class)
+    # 对于 binary，保持 [M, 1]；对于 multi-class，seg MLP 输出 [M, C] 后直接传入。
+    # 注意：rasterizer 要求 semantic_feature 维度 <= NUM_SEMANTIC_CHANNELS (128)。
+    seg_feature = segmentation  # [M, 1] or [M, C]
     # [关键改进 v4] 只 detach opacity：
     # 切断 mask loss → opacity → mlp_opacity → feat → RGB 的主要冲突路径。
     # 保留 xyz/scaling/rotation 的梯度，让 mask 仍可通过调整位置/大小来对齐 GT。
-    rendered_mask_3ch, _ = rasterizer_mask(
+    _, rendered_mask_feature, _, _ = rasterizer_mask(
         means3D = xyz,
         means2D = screenspace_points,
         shs = None,
-        colors_precomp = seg_features,
+        colors_precomp = torch.zeros_like(color),  # dummy colors for mask pass
+        semantic_feature = seg_feature,
         opacities = opacity.detach(),
         scales = scaling,
         rotations = rot,
         cov3D_precomp = None,
     )
-    # all 3 channels are identical; keep a single-channel tensor [1, H, W]
-    rendered_mask = rendered_mask_3ch[0:1, :, :]
-    
+    # rendered_mask_feature: [NUM_SEMANTIC_CHANNELS, H, W] or [C, H, W]
+    # For binary: take the first channel [1, H, W]
+    # For multi-class: take all C channels [C, H, W]
+    if seg_feature.shape[1] == 1:
+        rendered_mask = rendered_mask_feature[0:1, :, :]
+    else:
+        rendered_mask = rendered_mask_feature[:seg_feature.shape[1], :, :]
+
     # [修改点4] 始终返回包含 mask 的完整字典
     return {"render": rendered_image,
-            "mask": rendered_mask,  # 现在这里肯定有值了！
+            "mask": rendered_mask,  # [1, H, W] for binary or [C, H, W] for multi-class
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
