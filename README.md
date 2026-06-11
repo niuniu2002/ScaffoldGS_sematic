@@ -1,397 +1,342 @@
-# Scaffold-GS-Semantic: Scaffold-GS with Semantic Segmentation Support
+# Scaffold-GS-Semantic: Anchor-Based 3D Gaussian Splatting with Semantic Segmentation
 
-> **This is a fork of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) extended with semantic segmentation capabilities.**  
-> Original authors: [Tao Lu](https://github.com/inspirelt), [Mulin Yu](https://scholar.google.com/citations?user=w0Od3hQAAAAJ), [Linning Xu](https://eveneveno.github.io/lnxu), [Yuanbo Xiangli](https://kam1107.github.io/), [Limin Wang](https://wanglimin.github.io/), [Dahua Lin](http://dahua.site/), [Bo Dai](https://daibo.info/)
+> **An extended fork of [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for UAV aerial-image 3D reconstruction and semantic segmentation.**
+>
+> This project targets **3D semantic segmentation of Solidago canadensis (加拿大一枝黄花)** from UAV imagery, enabling downstream applications such as volume estimation, precision spraying, and quantitative governance.
 
-[Tao Lu](https://github.com/inspirelt), [Mulin Yu](https://scholar.google.com/citations?user=w0Od3hQAAAAJ), [Linning Xu](https://eveneveno.github.io/lnxu), [Yuanbo Xiangli](https://kam1107.github.io/), [Limin Wang](https://wanglimin.github.io/), [Dahua Lin](http://dahua.site/), [Bo Dai](https://daibo.info/) <br />
-
-
-[[`Project Page`](https://city-super.github.io/scaffold-gs/)][[`arxiv`](https://arxiv.org/abs/2312.00109)][[`Viewer`](https://drive.google.com/file/d/17nPVnRRxO4zMQJ_fKHm13HzvD0wUZ8XF/view?usp=sharing)]
-
-## News
-
-**[2026.04]** 🎈 This fork adds **semantic segmentation support** to Scaffold-GS, including per-anchor and per-Gaussian segmentation, KNN spatial consistency loss, and two-stage training. See [Semantic Segmentation](#semantic-segmentation) below.
-
-**[2024.09.25]** 🎈We propose **Octree-AnyGS**, a general anchor-based framework that supports explicit Gaussians (2D-GS, 3D-GS) and neural Gaussians (Scaffold-GS). Additionally, **Octree-GS** has been adapted to the aforementioned Gaussian primitives, enabling Level-of-Detail representation for large-scale scenes. This framework holds potential for application to other Gaussian-based methods, with relevant SIBR visualizations forthcoming.(https://github.com/city-super/Octree-AnyGS)
-
-**[2024.05.28]**  We update the [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) to conform to the file structure at training.
-
-**[2024.04.05]**  Scaffold-GS is selected as a 🎈**highlight** in CVPR2024.
-
-**[2024.03.27]**  🎈We release [Octree-GS](https://city-super.github.io/octree-gs), supporting an explicit *LOD* representation, rendering faster in large-scale scene with high quality.
-
-**[2024.03.26]**  🎈We release [GSDF](https://city-super.github.io/GSDF/), which improves rendering and reconstruction quality simultaneously.
-
-**[2024.02.27]**  Accepted to [CVPR 2024](https://cvpr.thecvf.com/).
-
-**[2024.01.22]**  We add the appearance embedding to Scaffold-GS to handle wild scenes.
-
-**[2024.01.22]** 🎈👀 The [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) for Scaffold-GS is available now.
-
-**[2023.12.10]** We release the code.
-
-## TODO List
-- [ ] Explore on removing the MLP module
-- [ ] Improve the training configuration system
-
-## What is Different in This Fork?
-
-This repository extends the original **Scaffold-GS** with the following capabilities:
-
-| Feature | Original Scaffold-GS | This Fork |
-|---|---|---|
-| Semantic Segmentation | ❌ | ✅ Per-anchor / Per-Gaussian |
-| Segmentation Head | — | ✅ 3-layer residual MLP (128 hidden) |
-| Two-Stage Training | ❌ | ✅ Freeze geometry, train seg head only |
-| KNN Spatial Consistency | ❌ | ✅ Symmetric BCE loss in probability space |
-| Mask Rendering Fix | — | ✅ Opacity detach to prevent gradient conflict |
-
-See the [Semantic Segmentation](#semantic-segmentation) section below for details.
+[![Scaffold-GS](https://img.shields.io/badge/Base-Scaffold--GS-blue)](https://github.com/city-super/Scaffold-GS)
+[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![CUDA](https://img.shields.io/badge/CUDA-11.6%2B-green.svg)](https://developer.nvidia.com/cuda-downloads)
 
 ---
 
-## Overview
+## What is Different?
 
-<p align="center">
-<img src="assets/pipeline.png" width=100% height=100% 
-class="center">
-</p>
+| Feature | Scaffold-GS (Original) | This Fork |
+|---|---|---|
+| Semantic Segmentation | ❌ | ✅ Binary & Multi-class |
+| Segmentation Head | — | ✅ 3-layer residual MLP (128 hidden, LayerNorm) |
+| Per-Gaussian Seg | — | ✅ Optional independent logits per offset |
+| KNN Consistency Loss | — | ✅ Symmetric BCE (binary) / Symmetric KL (multi-class) |
+| Opacity Detach | — | ✅ Mask pass uses `opacity.detach()` to protect geometry |
+| Multi-class Rendering | — | ✅ CUDA rasterizer supports up to 128 channels |
+| Two-Stage Training | — | ✅ `seg_only` freeze geometry, train head only |
+| Auto Two-Stage | — | ✅ Automatic geometry pretraining + semantic fine-tuning |
+| Label-Shift Robustness | — | ✅ Uncertainty-aware pixel weighting |
 
+---
 
-We introduce Scaffold-GS, which uses anchor points to distribute local 3D Gaussians, and predicts their attributes on-the-fly based on viewing direction and distance within the view frustum.
+## Benchmark Datasets
 
-Our method performs superior on scenes with challenging observing views. e.g. transparency, specularity, reflection, texture-less regions and fine-scale details.
+We evaluate on **three UAV-captured scenes** with binary segmentation masks:
 
-<p align="center">
-<img src="assets/teaser_big.png" width=100% height=100% 
-class="center">
-</p>
+| Dataset | Images | Train / Test | Resolution | Mask Source | Path |
+|---|---|---|---|---|---|
+| `dronev4_2` | 333 | 266 / 67 | — | SAM + Human | `data/dronev4_2` |
+| `lfy/colmap_scene` | 200 | — / 40 (test_list) | 1920×1080 | ISAT annotation | `data/lfy/colmap_scene` |
+| `SW_scenes/scene_01` | 479 (sparse/0) | TBD | 3840×2160 | SegmentationClass | `data/SW_scenes/scene_01` |
 
+> **Note on `dronev4_2`**: Training uses SAM-generated masks; evaluation on `myvideo` (37 images, human-annotated) reveals a **label-shift gap** (SAM vs Human IoU ≈ 0.62). See [Evaluation](#evaluation) for mitigation strategies.
 
+### Data Layout
 
+Each scene follows standard COLMAP structure:
 
+```
+scene_name/
+├── images/
+│   ├── IMG_001.jpg
+│   └── ...
+├── masks/              # optional: binary masks (0=bg, 255=fg) or class indices
+│   ├── IMG_001.png
+│   └── ...
+├── sparse/
+│   └── 0/
+│       ├── cameras.bin
+│       ├── images.bin
+│       └── points3D.bin
+├── train_list.txt      # optional: one basename per line
+└── test_list.txt       # optional: one basename per line
+```
+
+---
 
 ## Installation
 
-We tested on a server configured with Ubuntu 18.04, cuda 11.6 and gcc 9.4.0. Other similar configurations should also work, but we have not verified each one individually.
+```bash
+# 1. Clone
+git clone https://github.com/niuniu2002/ScaffoldGS_sematic.git
+cd ScaffoldGS_sematic
 
-1. Clone this repo:
-
-```
-git clone https://github.com/city-super/Scaffold-GS.git --recursive
-cd Scaffold-GS
-```
-
-2. Install dependencies
-
-```
-SET DISTUTILS_USE_SDK=1 # Windows only
+# 2. Create env
 conda env create --file environment.yml
 conda activate scaffold_gs
+
+# 3. Build CUDA submodules
+cd submodules/diff-gaussian-rasterization && pip install -e .
+cd ../simple-knn && pip install -e .
 ```
-
-## Semantic Segmentation
-
-This fork extends Scaffold-GS with **semantic segmentation** capabilities. Each anchor (or per-Gaussian) can predict a segmentation logit, which is rendered into a binary mask alongside the RGB image.
-
-### Key Features
-
-- **Per-Anchor Segmentation** (`use_per_gaussian_seg=False`): Each anchor predicts a single segmentation value, shared by all its offset Gaussians via `repeat_interleave`.
-- **Per-Gaussian Segmentation** (`use_per_gaussian_seg=True`): Each offset Gaussian predicts its own independent segmentation logit, enabling finer mask boundaries.
-- **Deeper Segmentation Head** (`SegmentationHead`): A 3-layer residual MLP with 128 hidden units and LayerNorm, replacing the original shallow 2-layer head.
-- **KNN Spatial Consistency Loss**: Neighboring anchors are encouraged to have similar segmentation predictions via a symmetric BCE loss in probability space.
-- **Two-Stage Training** (`--seg_only`): Freeze all geometry and appearance parameters, and train only the segmentation head on a pre-trained model.
-
-### Architecture Details
-
-```python
-# SegmentationHead (scene/gaussian_model.py)
-SegmentationHead(feat_dim=32, hidden_dim=128, num_layers=3, dropout=0.0, num_outputs=1)
-# - input_proj + input_norm
-# - 3x residual blocks (Linear + LayerNorm + ReLU)
-# - logit_head (returns logit; sigmoid applied externally)
-```
-
-### Training Modes
-
-#### Mode 1: Joint Training (from scratch or pre-trained)
-Train geometry, appearance, and segmentation jointly. Semantic loss starts at `start_semantic_iter` with a warmup ramp.
-
-```bash
-python train.py -s data/dronev4_2 \
-  --start_semantic_iter 5000 \
-  --mask_weight 0.2 \
-  --knn_weight 0.05 \
-  --knn_every 100 \
-  --knn_offset 55 \
-  --focal_alpha 0.25 \
-  --use_per_gaussian_seg False
-```
-
-#### Mode 2: Two-Stage Training (`--seg_only`)
-Load a pre-trained geometry checkpoint, freeze all parameters, replace the segmentation head with a deeper MLP, and optimize only the seg head.
-
-```bash
-python train.py -s data/dronev4_2 \
-  --seg_only \
-  --start_semantic_iter 0 \
-  --iterations 10000 \
-  --mask_weight 0.2 \
-  --knn_weight 0.05 \
-  --load_iteration 30000
-```
-
-> In two-stage mode, densification is automatically disabled, and the optimizer only tracks `mlp_segmentation` parameters (~55K params).
-
-### Key Parameters
-
-| Parameter | Default | Description |
-|---|---|---|
-| `--use_per_gaussian_seg` | `False` | Enable per-Gaussian (per-offset) segmentation instead of per-anchor |
-| `--seg_only` | `False` | Two-stage mode: freeze geometry, only train seg head |
-| `--start_semantic_iter` | `0` | Iteration to start semantic loss |
-| `--mask_weight` | `0.0` | Weight for the mask BCE loss |
-| `--focal_alpha` | `0.25` | Focal loss alpha for handling class imbalance |
-| `--knn_weight` | `0.0` | Weight for KNN spatial consistency loss |
-| `--knn_every` | `100` | Compute KNN loss every N iterations |
-| `--knn_offset` | `0` | Delay KNN loss start by N iterations |
-
-### KNN Loss Improvement
-
-The KNN loss has been upgraded from MSE to **symmetric BCE** in probability space:
-
-```
-L_KNN = -0.5 * [ p_i*log(p_j) + (1-p_i)*log(1-p_j) + p_j*log(p_i) + (1-p_j)*log(1-p_i) ]
-```
-
-This avoids the "push-to-0.5" issue of MSE and forces neighboring anchors to agree on both foreground and background.
-
-### Renderer Fix
-
-During mask rendering, `opacity` is **detached** from the computation graph to prevent mask loss from interfering with the opacity MLP:
-
-```python
-rendered_mask, _ = rasterizer_mask(
-    ...,
-    opacities = opacity.detach(),  # Cut gradient path: mask loss -> opacity
-    ...
-)
-```
-
-### Recommended Configurations (based on `dronev4_2` experiments)
-
-| Scenario | `update_until` | `start_semantic_iter` | `focal_alpha` | Notes |
-|---|---|---|---|---|
-| Best Quality | `15000` | `5000` | `0.25` | Full densification + late semantic start |
-| Quality-Speed Balance | `0` (off) | `5000` | `0.25` | Pre-trained geometry, no densify, 85 FPS |
-| Two-Stage | N/A (off) | `0` | `0.25` | Freeze geometry, train seg head only |
-
-> See `试验记录.md` for detailed experimental results and ablation studies.
 
 ---
 
-## Data
+## Quick Start
 
-First, create a ```data/``` folder inside the project path by 
-
-```
-mkdir data
-```
-
-The data structure will be organised as follows:
-
-```
-data/
-├── dataset_name
-│   ├── scene1/
-│   │   ├── images
-│   │   │   ├── IMG_0.jpg
-│   │   │   ├── IMG_1.jpg
-│   │   │   ├── ...
-│   │   ├── sparse/
-│   │       └──0/
-│   ├── scene2/
-│   │   ├── images
-│   │   │   ├── IMG_0.jpg
-│   │   │   ├── IMG_1.jpg
-│   │   │   ├── ...
-│   │   ├── sparse/
-│   │       └──0/
-...
-```
-
-
-### Public Data
-
-The BungeeNeRF dataset is available in [Google Drive](https://drive.google.com/file/d/1nBLcf9Jrr6sdxKa1Hbd47IArQQ_X8lww/view?usp=sharing)/[百度网盘[提取码:4whv]](https://pan.baidu.com/s/1AUYUJojhhICSKO2JrmOnCA). The MipNeRF360 scenes are provided by the paper author [here](https://jonbarron.info/mipnerf360/). And we test on scenes ```bicycle, bonsai, counter, garden, kitchen, room, stump```. The SfM data sets for Tanks&Temples and Deep Blending are hosted by 3D-Gaussian-Splatting [here](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip). Download and uncompress them into the ```data/``` folder.
-
-### Custom Data
-
-For custom data, you should process the image sequences with [Colmap](https://colmap.github.io/) to obtain the SfM points and camera poses. Then, place the results into ```data/``` folder.
-
-
-## Training
-
-### Training multiple scenes
-
-To train multiple scenes in parallel, we provide batch training scripts: 
-
- - Tanks&Temples: ```train_tnt.sh```
- - MipNeRF360: ```train_mip360.sh```
- - BungeeNeRF: ```train_bungee.sh```
- - Deep Blending: ```train_db.sh```
- - Nerf Synthetic: base ->```train_nerfsynthetic.sh```; with warmup->```train_nerfsynthetic_withwarmup.sh```
-
- run them with 
-
- ```
-bash train_xxx.sh
- ```
-
- > Notice 1: Make sure you have enough GPU cards and memories to run these scenes at the same time.
-
- > Notice 2: Each process occupies many cpu cores, which may slow down the training process. Set ```torch.set_num_threads(32)``` accordingly in the ```train.py``` to alleviate it.
-
-### Training a single scene
-
-For training a single scene, modify the path and configurations in ```single_train.sh``` accordingly and run it:
-
-```
-bash ./single_train.sh
-```
-
-- scene: scene name with a format of ```dataset_name/scene_name/``` or ```scene_name/```;
-- exp_name: user-defined experiment name;
-- gpu: specify the GPU id to run the code. '-1' denotes using the most idle GPU. 
-- voxel_size: size for voxelizing the SfM points, smaller value denotes finer structure and higher overhead, '0' means using the median of each point's 1-NN distance as the voxel size.
-- update_init_factor: initial resolution for growing new anchors. A larger one will start placing new anchor in a coarser resolution.
-
-> For these public datasets, the configurations of 'voxel_size' and 'update_init_factor' can refer to the above batch training script.
-
-### Training with Semantic Segmentation
-
-For joint training (geometry + segmentation):
+### Binary Segmentation (Single Scene)
 
 ```bash
 python train.py \
-  -s data/dronev4_2 \
-  --exp_name dronev4_2_semantic \
+  -s /path/to/dronev4_2 \
+  -m output/dronev4_2_baseline \
   --start_semantic_iter 5000 \
-  --mask_weight 0.2 \
-  --knn_weight 0.05 \
+  --mask_weight 0.1 \
+  --mask_warmup 1000 \
+  --mask_ramp 3000 \
+  --knn_weight 0.02 \
+  --knn_warmup 2000 \
+  --knn_ramp 3000 \
   --knn_every 100 \
   --knn_offset 55 \
   --focal_alpha 0.25 \
-  --update_until 15000 \
+  --update_until 0 \
   --iterations 30000
 ```
 
-For two-stage segmentation training (requires a pre-trained checkpoint):
+### Multi-class Segmentation
 
 ```bash
 python train.py \
-  -s data/dronev4_2 \
-  --exp_name dronev4_2_twostage \
-  --seg_only \
-  --start_semantic_iter 0 \
-  --mask_weight 0.2 \
-  --knn_weight 0.05 \
-  --knn_every 100 \
-  --knn_offset 55 \
-  --iterations 10000 \
-  --load_iteration 30000
+  -s /path/to/scene \
+  -m output/scene_multiclass \
+  --num_classes 8 \
+  --start_semantic_iter 5000 \
+  --mask_weight 0.1 \
+  --knn_weight 0.02 \
+  --focal_alpha 0.25 \
+  --update_until 0 \
+  --iterations 30000
 ```
 
-> For scenes with a mask/ folder containing binary segmentation ground truth (0=background, 255=foreground), the dataloader will automatically load and pair masks with images. 
+### Evaluation
 
+```bash
+# Standard evaluation (PSNR + mIoU on test set)
+python eval_myvideo.py -m output/dronev4_2_baseline --iteration 30000
 
-This script will store the log (with running-time code) into ```outputs/dataset_name/scene_name/exp_name/cur_time``` automatically.
-
-
-
-
-
-## Evaluation
-
-We've integrated the rendering and metrics calculation process into the training code. So, when completing training, the ```rendering results```, ```fps``` and ```quality metrics``` will be printed automatically. And the rendering results will be save in the log dir. Mind that the ```fps``` is roughly estimated by 
-
-```
-torch.cuda.synchronize();t_start=time.time()
-rendering...
-torch.cuda.synchronize();t_end=time.time()
+# Multi-class standalone evaluation
+python eval_multiclass.py \
+  --model_path output/scene_multiclass \
+  --source_path /path/to/scene \
+  --iteration 30000 \
+  --num_classes 8
 ```
 
-which may differ somewhat from the original 3D-GS, but it does not affect the analysis.
+---
 
-Meanwhile, we keep the manual rendering function with a similar usage of the counterpart in [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting), one can run it by 
+## Experiment Configurations
 
-```
-python tools/render.py -m <path to trained model> # Generate renderings
-python tools/metrics.py -m <path to trained model> # Compute error metrics on renderings
-```
+All scripts below are located in `configs/` and can be run directly:
 
-## Viewer
-
-The [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) for Scaffold-GS is available now. 
-
-Recommended dataset structure in the source path location:
-
-```
-<location>
-|---sparse
-    |---0
-        |---cameras.bin
-        |---images.bin
-        |---points3D.bin
+```bash
+bash configs/run_dronev4_2_baseline.sh
 ```
 
-or
+### Verified Baselines on `dronev4_2`
+
+| Config | `start_sem` | `mask_w` | `knn_w` | `focal_a` | `update_until` | PSNR | mIoU | FG IoU | BG IoU |
+|---|---|---|---|---|---|---|---|---|---|
+| **exp01_sem_ramp** | 0 | 0.2 | 0.05 | 0.25 | 15000 | 24.71 | **0.7880** | 0.6216 | 0.9804 |
+| **exp02_late_sem** | 5000 | 0.2 | 0.05 | 0.25 | 15000 | 24.68 | **0.7891** | 0.6236 | 0.9807 |
+| **exp03_nodensify** | 5000 | 0.2 | 0.05 | 0.25 | 0 | 24.63 | 0.7885 | 0.6178 | 0.9798 |
+| **user_params** | 5000 | 0.1 | 0.02 | 0.25 | 0 | 24.54 | 0.7459 | 0.6164 | 0.9809 |
+| **exp06_stopdensify15k** | 5000 | 0.2 | 0.05 | 0.25 | 15000 | **25.04** | 0.7778 | 0.6197 | 0.9810 |
+
+**Key Insights** (from ablation studies):
+- `focal_alpha=0.25` is the sweet spot. `0.75` biases toward background and locks mIoU low.
+- `mask_weight=0.1` balances mIoU and PSNR. Above `0.2`, PSNR gap exceeds 3 dB (geometry collapse).
+- `knn_weight=0.02` gives spatial consistency without over-smoothing.
+- `update_until` is **not** the primary factor for mIoU-PSNR trade-off; `focal_alpha` + `mask_weight` dominate.
+
+### Recommended Configurations
+
+#### A. Best mIoU (Joint Training)
+```bash
+--start_semantic_iter 5000 \
+--mask_weight 0.1 --mask_warmup 1000 --mask_ramp 3000 \
+--knn_weight 0.02 --knn_warmup 2000 --knn_ramp 3000 \
+--knn_every 100 --knn_offset 55 \
+--focal_alpha 0.25 \
+--update_until 0 \
+--iterations 30000
+```
+> Test mIoU ≈ 0.75, PSNR gap ≈ 1.0 dB (minimal overfitting).
+
+#### B. High mIoU with Acceptable PSNR Gap
+```bash
+--start_semantic_iter 0 \
+--mask_weight 0.2 --mask_warmup 1000 --mask_ramp 3000 \
+--knn_weight 0.05 --knn_warmup 2000 --knn_ramp 3000 \
+--knn_every 100 --knn_offset 55 \
+--focal_alpha 0.25 \
+--update_until 15000 \
+--iterations 33000
+```
+> Test mIoU ≈ 0.79, PSNR gap ≈ 3.5–4.0 dB.
+
+#### C. Two-Stage (`seg_only`) — Freeze Geometry
+```bash
+--seg_only \
+--load_iteration 30000 \
+--start_semantic_iter 0 \
+--mask_weight 0.2 \
+--knn_weight 0.05 \
+--iterations 10000
+```
+> **Note**: `seg_only` consistently underperforms joint training. Prefer joint training with controlled `mask_weight`.
+
+---
+
+## Full Parameter Reference
+
+### Semantic Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--num_classes` | `1` | `1`=binary (sigmoid), `>=2`=multi-class (softmax) |
+| `--use_per_gaussian_seg` | `False` | Independent seg logit per offset Gaussian |
+| `--start_semantic_iter` | `7000` | Hard warmup: skip mask/knn losses before this iter |
+| `--mask_weight` | `0.01` | Weight for mask loss (focal + dice) |
+| `--mask_warmup` | `0` | Iterations to keep mask weight at 0 |
+| `--mask_ramp` | `0` | Iterations to linearly ramp to full weight |
+| `--mask_weight_final` | `-1` | Final mask weight for decay schedule (-1=disabled) |
+| `--knn_weight` | `0.05` | Weight for KNN consistency loss |
+| `--knn_every` | `100` | Compute KNN every N iterations |
+| `--knn_offset` | `55` | Scheduling offset within KNN period |
+| `--knn_warmup` | `0` | KNN weight ramp start |
+| `--knn_ramp` | `0` | KNN weight ramp length |
+| `--focal_alpha` | `0.25` | Focal loss alpha (class imbalance) |
+| `--focal_gamma` | `2.0` | Focal loss gamma (hard example mining) |
+| `--uncertainty_min` | `0.1` | Minimum pixel weight for soft pseudo-labels |
+| `--uncertainty_power` | `2.0` | Confidence-to-weight curve shape |
+| `--seg_only` | `False` | Two-stage: freeze geometry, train seg head only |
+| `--seg_only_reuse_head` | `False` | Keep original seg head in two-stage mode |
+| `--auto_twostage` | `False` | Automatic geometry pretraining + semantic fine-tuning |
+| `--no_opacity_detach` | `False` | Allow mask gradients into opacity MLP |
+| `--opacity_grad_until` | `-1` | Gradual opacity detach (-1=use flag) |
+
+### Anchor Densification
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--start_stat` | `500` | Start accumulating gradient statistics |
+| `--update_from` | `1500` | First densification iteration |
+| `--update_interval` | `100` | Densification check interval |
+| `--update_until` | `15000` | Stop densification (-1=never stop, 0=disable) |
+| `--densify_grad_threshold` | `0.0002` | Gradient threshold for anchor growing |
+| `--min_opacity` | `0.005` | Opacity threshold for pruning |
+
+---
+
+## Architecture
+
+### Dual-Pass Rasterization
 
 ```
-<location>
-|---points3D.ply
-|---transforms.json
+Pass 1: RGB
+  rasterizer(means3D, colors_precomp=color, opacities=opacity)
+  -> rendered_image
+
+Pass 2: Semantic Mask
+  seg_feature = pad(segmentation_probs, 128 channels)
+  rasterizer_mask(means3D, semantic_feature=seg_feature, opacities=opacity.detach())
+  -> rendered_mask
 ```
 
-Recommended checkpoint  structure in the model path location:
+> **Critical**: Mask pass uses `opacity.detach()` to prevent semantic loss gradients from flowing into the opacity MLP, protecting RGB reconstruction quality.
 
-```
-<location>
-|---point_cloud
-|   |---point_cloud.ply
-|   |---color_mlp.pt
-|   |---cov_mlp.pt
-|   |---opacity_mlp.pt
-(|   |---embedding_appearance.pt)
-|---cfg_args
-|---cameras.json
-(|---input.ply)
+### Segmentation Head
+
+```python
+SegmentationHead(feat_dim=32, hidden_dim=128, num_layers=3, dropout=0.0, num_outputs=1)
+# input_proj + LayerNorm + ReLU
+# 3x residual blocks (Linear + LayerNorm + ReLU)
+# logit_head -> sigmoid (binary) or softmax (multi-class)
 ```
 
+### KNN Consistency Loss
 
-## Contact
+- **Binary**: Symmetric BCE in probability space
+  ```
+  L = -0.5 * [ p_i*log(p_j) + (1-p_i)*log(1-p_j) + p_j*log(p_i) + (1-p_j)*log(1-p_i) ]
+  ```
+- **Multi-class**: Symmetric KL divergence in logit space
 
-- Tao Lu: taolu@smail.nju.edu.cn
-- Mulin Yu: yumulin@pjlab.org.cn
+---
+
+## Evaluation Notes
+
+### Train vs Test Sample Size Bias
+
+In `training_report()`:
+- **Train set**: Only **5 cameras** evaluated (`range(5, 30, 5)`)
+- **Test set**: **All** test cameras evaluated
+
+**Train mIoU is NOT directly comparable to test mIoU.** Use test mIoU as the ground truth.
+
+### SAM Label Shift vs Human Annotations
+
+The `dronev4_2` dataset uses **SAM-generated masks** for training. The `myvideo` subset (37 images) uses **human annotations**.
+
+- SAM vs Human mean IoU: **0.62**
+- 30/37 images have IoU < 0.7
+- This is a **label-shift** problem, not traditional overfitting.
+
+**Mitigation**:
+- Lower `mask_weight` (0.05–0.1)
+- Add label smoothing
+- Use `uncertainty_min` / `uncertainty_power` to down-weight edge pixels
+
+---
+
+## Project Structure
+
+```
+Scaffold-GSLFY/
+├── train.py                          # Main training loop
+├── scene/
+│   ├── gaussian_model.py             # GaussianModel, SegmentationHead, densification
+│   ├── dataset_readers.py            # COLMAP/Blender data loading, mask loading
+│   └── __init__.py                   # Scene class
+├── gaussian_renderer/__init__.py     # Neural Gaussian generation + dual-pass rasterization
+├── arguments/__init__.py             # All CLI hyperparameters
+├── eval_myvideo.py                   # Binary IoU evaluation (human-annotated test)
+├── eval_multiclass.py                # Standalone multi-class IoU evaluation
+├── eval_scene_multiclass.py          # Per-scene multi-class evaluation
+├── tools/
+│   ├── render.py                     # Standard RGB + mask rendering
+│   ├── render1.py                    # Rendering with semantic heatmap overlay
+│   └── metrics.py                    # PSNR / SSIM / LPIPS
+├── configs/                          # Benchmark experiment scripts
+└── submodules/
+    ├── diff-gaussian-rasterization/  # CUDA rasterizer (128-channel semantic_feature)
+    └── simple-knn/                   # KNN search utility
+```
+
+---
 
 ## Citation
 
-If you find our work helpful, please consider citing:
+If you use this work, please cite both the original Scaffold-GS and acknowledge this extension:
 
 ```bibtex
 @inproceedings{scaffoldgs,
   title={Scaffold-gs: Structured 3d gaussians for view-adaptive rendering},
   author={Lu, Tao and Yu, Mulin and Xu, Linning and Xiangli, Yuanbo and Wang, Limin and Lin, Dahua and Dai, Bo},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  booktitle={CVPR},
   pages={20654--20664},
   year={2024}
 }
 ```
 
-## LICENSE
+## License
 
 Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting).
-
-## Acknowledgement
-
-We thank all authors from [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting) for presenting such an excellent work.
