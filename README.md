@@ -38,6 +38,18 @@ We evaluate on **three UAV-captured scenes** with binary segmentation masks:
 
 > **Note on `dronev4_2`**: Training uses SAM-generated masks; evaluation on `myvideo` (37 images, human-annotated) reveals a **label-shift gap** (SAM vs Human IoU ≈ 0.62). See [Evaluation](#evaluation) for mitigation strategies.
 
+### Download
+
+All benchmark datasets and 2D segmentation weights are packaged here:
+
+🔗 **Quark Netdisk**: https://pan.quark.cn/s/0833e64fe708
+
+Contents include:
+- `dronev4_2/` — UAV aerial images + SAM masks + human annotations
+- `lfy/colmap_scene/` — COLMAP scene with ISAT-labeled masks
+- `SW_scenes/scene_01/` — High-res UAV scene (3840×2160) + segmentation masks
+- 2D segmentation model weights (for pseudo-label generation)
+
 ### Data Layout
 
 Each scene follows standard COLMAP structure:
