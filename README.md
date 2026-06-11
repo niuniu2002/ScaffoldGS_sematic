@@ -36,8 +36,6 @@ We evaluate on **three UAV-captured scenes** with binary segmentation masks:
 | `lfy/colmap_scene` | 200 | — / 40 (test_list) | 1920×1080 | ISAT annotation | `data/lfy/colmap_scene` |
 | `SW_scenes/scene_01` | 479 (sparse/0) | TBD | 3840×2160 | SegmentationClass | `data/SW_scenes/scene_01` |
 
-> **Note on `dronev4_2`**: Training uses SAM-generated masks; evaluation on `myvideo` (37 images, human-annotated) reveals a **label-shift gap** (SAM vs Human IoU ≈ 0.62). See [Evaluation](#evaluation) for mitigation strategies.
-
 ### Download
 
 All benchmark datasets and 2D segmentation weights are packaged here:
@@ -131,10 +129,10 @@ python train.py \
 ### Evaluation
 
 ```bash
-# Standard evaluation (PSNR + mIoU on test set)
-python eval_myvideo.py -m output/dronev4_2_baseline --iteration 30000
+# Evaluation is integrated into training; test-set PSNR + mIoU are reported
+# automatically at scheduled testing iterations.
 
-# Multi-class standalone evaluation
+# For standalone multi-class evaluation:
 python eval_multiclass.py \
   --model_path output/scene_multiclass \
   --source_path /path/to/scene \
@@ -154,19 +152,37 @@ bash configs/run_dronev4_2_baseline.sh
 
 ### Verified Baselines on `dronev4_2`
 
-| Config | `start_sem` | `mask_w` | `knn_w` | `focal_a` | `update_until` | PSNR | mIoU | FG IoU | BG IoU |
-|---|---|---|---|---|---|---|---|---|---|
-| **exp01_sem_ramp** | 0 | 0.2 | 0.05 | 0.25 | 15000 | 24.71 | **0.7880** | 0.6216 | 0.9804 |
-| **exp02_late_sem** | 5000 | 0.2 | 0.05 | 0.25 | 15000 | 24.68 | **0.7891** | 0.6236 | 0.9807 |
-| **exp03_nodensify** | 5000 | 0.2 | 0.05 | 0.25 | 0 | 24.63 | 0.7885 | 0.6178 | 0.9798 |
-| **user_params** | 5000 | 0.1 | 0.02 | 0.25 | 0 | 24.54 | 0.7459 | 0.6164 | 0.9809 |
-| **exp06_stopdensify15k** | 5000 | 0.2 | 0.05 | 0.25 | 15000 | **25.04** | 0.7778 | 0.6197 | 0.9810 |
+All metrics are reported on the **test set** (67 images).
+
+#### Test Set PSNR & mIoU
+
+| Config | `start_sem` | `update_until` | `focal_alpha` | `mask_weight` | ITER 7000 PSNR | ITER 7000 mIoU | ITER 30000 PSNR | ITER 30000 mIoU |
+|---|---|---|---|---|---|---|---|---|
+| **exp01_sem_ramp** | 0 | 15000 | 0.75 | 0.2 | 24.88 | 0.7809 | 24.71 | 0.7880 |
+| **exp02_late_sem** | 5000 | 15000 | 0.75 | 0.2 | **24.90** | 0.7752 | 24.68 | 0.7891 |
+| **exp03_nodensify** | 5000 | 0 | 0.25 | 0.2 | 24.83 | 0.7767 | 24.63 | 0.7885 |
+| **exp03_scratch** | 5000 | 0 | 0.25 | 0.2 | 24.03 | 0.6477 | 24.41 | 0.7570 |
+| **exp04_stop5000** | 5000 | 5000 | 0.25 | 0.2 | 24.47 | 0.6561 | 24.79 | 0.7617 |
+| **exp05_stop10000** | 5000 | 10000 | 0.25 | 0.2 | 24.47 | 0.6661 | 24.87 | 0.7741 |
+| **exp06_stop15000** | 5000 | 15000 | 0.25 | 0.2 | 24.45 | 0.6631 | **25.04** | 0.7778 |
+
+#### Final Rendering Quality (Test Set)
+
+| Config | SSIM ↑ | PSNR ↑ | LPIPS ↓ | FPS ↑ | Avg Visible Count |
+|---|---|---|---|---|---|
+| exp01_sem_ramp | 0.6902 | 24.7041 | 0.2969 | 29.23 | 390,896 |
+| exp02_late_sem | 0.6886 | 24.6374 | 0.2964 | 46.36 | 390,532 |
+| **exp03_nodensify** | 0.6872 | 24.6282 | 0.2961 | **85.20** | 386,277 |
+| exp03_scratch | 0.6403 | 24.4052 | 0.3884 | **143.15** | 174,975 |
+| exp04_stop5000 | 0.6743 | 24.7904 | 0.3416 | 118.80 | 258,774 |
+| exp05_stop10000 | 0.6915 | 24.8688 | 0.2997 | 105.31 | 396,850 |
+| **exp06_stop15000** | **0.7017** | **25.0408** | **0.2870** | 92.72 | 474,184 |
 
 **Key Insights** (from ablation studies):
-- `focal_alpha=0.25` is the sweet spot. `0.75` biases toward background and locks mIoU low.
-- `mask_weight=0.1` balances mIoU and PSNR. Above `0.2`, PSNR gap exceeds 3 dB (geometry collapse).
-- `knn_weight=0.02` gives spatial consistency without over-smoothing.
-- `update_until` is **not** the primary factor for mIoU-PSNR trade-off; `focal_alpha` + `mask_weight` dominate.
+- **exp06_stop15000** achieves the best rendering quality (PSNR 25.04, SSIM 0.702, LPIPS 0.287).
+- **exp03_nodensify** offers the best quality-speed balance (PSNR 24.63, FPS 85.2) by disabling densification on a pre-trained model.
+- **exp01/exp02** use `focal_alpha=0.75` and suffer from slower inference (~29–46 FPS) compared to `focal_alpha=0.25` variants.
+- `update_until` strongly affects model size and speed; earlier stop = smaller model but lower quality.
 
 ### Recommended Configurations
 
@@ -294,19 +310,6 @@ In `training_report()`:
 
 **Train mIoU is NOT directly comparable to test mIoU.** Use test mIoU as the ground truth.
 
-### SAM Label Shift vs Human Annotations
-
-The `dronev4_2` dataset uses **SAM-generated masks** for training. The `myvideo` subset (37 images) uses **human annotations**.
-
-- SAM vs Human mean IoU: **0.62**
-- 30/37 images have IoU < 0.7
-- This is a **label-shift** problem, not traditional overfitting.
-
-**Mitigation**:
-- Lower `mask_weight` (0.05–0.1)
-- Add label smoothing
-- Use `uncertainty_min` / `uncertainty_power` to down-weight edge pixels
-
 ---
 
 ## Project Structure
@@ -320,7 +323,7 @@ Scaffold-GSLFY/
 │   └── __init__.py                   # Scene class
 ├── gaussian_renderer/__init__.py     # Neural Gaussian generation + dual-pass rasterization
 ├── arguments/__init__.py             # All CLI hyperparameters
-├── eval_myvideo.py                   # Binary IoU evaluation (human-annotated test)
+├── eval_myvideo.py                   # Binary IoU evaluation (test set)
 ├── eval_multiclass.py                # Standalone multi-class IoU evaluation
 ├── eval_scene_multiclass.py          # Per-scene multi-class evaluation
 ├── tools/
