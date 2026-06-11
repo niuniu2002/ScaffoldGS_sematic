@@ -165,6 +165,7 @@ All metrics are reported on the **test set** (67 images).
 | **exp04_stop5000** | 5000 | 5000 | 0.25 | 0.2 | 24.47 | 0.6561 | 24.79 | 0.7617 |
 | **exp05_stop10000** | 5000 | 10000 | 0.25 | 0.2 | 24.47 | 0.6661 | 24.87 | 0.7741 |
 | **exp06_stop15000** | 5000 | 15000 | 0.25 | 0.2 | 24.45 | 0.6631 | **25.04** | 0.7778 |
+| **🔥 mw04_nodetach** | 5000 | 15000 | 0.25 | **0.4** | — | — | 23.91 | **0.8300** |
 
 #### Final Rendering Quality (Test Set)
 
@@ -177,9 +178,11 @@ All metrics are reported on the **test set** (67 images).
 | exp04_stop5000 | 0.6743 | 24.7904 | 0.3416 | 118.80 | 258,774 |
 | exp05_stop10000 | 0.6915 | 24.8688 | 0.2997 | 105.31 | 396,850 |
 | **exp06_stop15000** | **0.7017** | **25.0408** | **0.2870** | 92.72 | 474,184 |
+| **🔥 mw04_nodetach** | — | 23.91 | — | — | — |
 
 **Key Insights** (from ablation studies):
-- **exp06_stop15000** achieves the best rendering quality (PSNR 25.04, SSIM 0.702, LPIPS 0.287).
+- **🔥 mw04_nodetach** achieves the highest test mIoU (**0.8300**) by allowing mask gradients into the opacity MLP (`no_opacity_detach`) with a stronger mask weight (0.4).
+- **exp06_stop15000** achieves the best rendering quality among detached configs (PSNR 25.04, SSIM 0.702, LPIPS 0.287).
 - **exp03_nodensify** offers the best quality-speed balance (PSNR 24.63, FPS 85.2) by disabling densification on a pre-trained model.
 - **exp01/exp02** use `focal_alpha=0.75` and suffer from slower inference (~29–46 FPS) compared to `focal_alpha=0.25` variants.
 - `update_until` strongly affects model size and speed; earlier stop = smaller model but lower quality.
