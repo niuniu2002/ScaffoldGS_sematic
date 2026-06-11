@@ -40,13 +40,43 @@ The `setup_env.sh` script provides an alternative setup path for a specific pre-
 
 ## Current Experiment Priority
 
-The following experiments are ordered by current effectiveness and recommended next steps:
+Based on extensive ablation studies on `dronev4_2`, the following configurations are ranked by effectiveness:
 
-1. **`exp01_sem_ramp`** (semantic ramp): Currently the most effective configuration. Semantic loss ramps up gradually alongside geometry training.
-2. **`exp02_late_sem`** (late semantic): Performance is roughly on par with `sem_ramp`. Semantic training starts later in the schedule.
-3. **`late_sem + no_densify`**: **Next highest-priority experiment to run.** This disables densification during the semantic training phase to test the hypothesis that anchor splitting/merging perturbs geometry and degrades RGB reconstruction quality (PSNR).
+### Verified Best Baseline: `user_params`
 
-**Rationale for `no_densify`:** If PSNR drops when semantic loss is active, densification may be the culprit. Freezing the anchor distribution while training the segmentation head isolates whether the semantic loss itself harms geometry or whether the interaction with densification does.
+The most **balanced** configuration found so far:
+- **Test mIoU**: ~0.75
+- **PSNR gap**: ~1.0 dB (train vs test, smallest among all configs)
+- **mIoU gap**: ~0.07 (train vs test, indicating minimal overfitting)
+
+```bash
+python train.py -s data/dronev4_2 -m outputs/exp_userparams \
+  --start_semantic_iter 5000 \
+  --mask_weight 0.1 --mask_warmup 1000 --mask_ramp 3000 \
+  --knn_weight 0.02 --knn_warmup 2000 --knn_ramp 3000 \
+  --knn_every 100 --knn_offset 55 \
+  --focal_alpha 0.25 \
+  --update_until 0 \
+  --iterations 30000
+```
+
+### High mIoU but Large PSNR Gap: `exp01_sem_ramp`, `exp03_nodensify`
+
+These achieve test mIoU ~0.79 but PSNR gap ~3.5-4.0 dB, indicating semantic loss is destroying geometry:
+- `exp01`: `focal_alpha=0.75, mask_weight=0.2, update_until=15000`
+- `exp03`: `focal_alpha=0.25, mask_weight=0.2, update_until=0`
+
+**Key insight**: `focal_alpha` and `mask_weight` together determine the mIoU-PSNR trade-off. `update_until` (densification) is NOT the primary factor.
+
+### Key Parameter Effects (from ablation studies)
+
+| Parameter | Low Value Effect | High Value Effect | Sweet Spot |
+|-----------|-----------------|-------------------|------------|
+| `focal_alpha` | 0.75: mIoU locked low OR PSNR crashes | 0.25: mIoU high, geometry stable | **0.25** |
+| `mask_weight` | 0.05: mIoU ceiling ~0.59 | 0.20: mIoU ~0.79, PSNR gap ~4 dB | **0.10** |
+| `knn_weight` | 0.02: spatial consistency without over-smoothing | 0.05: may over-smooth | **0.02** |
+
+**Rationale**: `focal_alpha=0.75` biases the model toward background, causing it to learn wrong decision boundaries. `mask_weight` above 0.1 causes the semantic loss to dominate and distort geometry.
 
 ## Common Training Commands
 
@@ -190,6 +220,24 @@ data/my_scene/
 
 The dataset reader (`scene/dataset_readers.py`) automatically detects `masks/` and pairs masks with images by basename.
 
+### SAM Label Noise vs Human Annotations
+
+**Critical**: The `dronev4_2` dataset uses **SAM-generated masks** for training. The `myvideo` subset (37 images, all overlapping with `dronev4_2`) uses **human-annotated masks** for testing.
+
+- SAM vs Human IoU: **0.62** (mean), with SAM tending to **over-segment**
+- 30/37 images have IoU < 0.7
+- This is a **label shift** problem, not just traditional overfitting
+
+**Implication**: Models trained on SAM masks learn SAM's noise patterns (over-segmentation). When evaluated on human annotations, they inherit these errors. Lower `mask_weight` (0.1 vs 0.2) and label smoothing help mitigate this.
+
+### Train/Test Split
+
+`dronev4_2` has 333 total images:
+- **Train**: 266 images (`train_list.txt`)
+- **Test**: 67 images (`test_list.txt`)
+
+Both use **SAM-generated masks**. `myvideo` is the **human-annotated hold-out test** (same 37 images, different masks).
+
 ## Key Files
 
 | File | Role |
@@ -207,11 +255,55 @@ The dataset reader (`scene/dataset_readers.py`) automatically detects `masks/` a
 
 When modifying code in this repository, adhere to the following constraints:
 
-1. **Do NOT modify the CUDA rasterizer** (`submodules/diff-gaussian-rasterization/`) unless there is an explicit, justified reason. The rasterizer is a stable, compiled dependency. Changes here require recompilation and can introduce hard-to-debug rendering artifacts.
-2. **Do NOT alter the COLMAP data structure or dataset reader conventions.** The `scene/dataset_readers.py` loader assumes standard COLMAP output (cameras.bin, images.bin, points3D.bin) and an optional `masks/` folder paired by basename. Deviations break data loading for all scenes.
-3. **When modifying loss functions or training schedules, monitor BOTH mIoU and PSNR.** A change that boosts segmentation accuracy but collapses RGB quality is not acceptable.
-4. **mIoU is the PRIMARY metric; PSNR is the GUARDRAIL metric.** Optimize for segmentation IoU first, but do not allow PSNR to degrade significantly below the no-segmentation baseline.
-5. **Do NOT trade RGB reconstruction quality for semantic performance.** Semantic gains achieved by destroying geometry (e.g., allowing densification to run unchecked, weakening opacity regularization) are invalid. If PSNR drops sharply, the modification is harmful regardless of mIoU improvement.
+1. **READ-ONLY FIRST**: When user requests inspection/analysis (e.g., "看看", "分析一下", "检查"), do NOT create, modify, or delete files. Do NOT run commands that change state. Report findings first, wait for approval before any edits.
+2. **Do NOT modify the CUDA rasterizer** (`submodules/diff-gaussian-rasterization/`) unless there is an explicit, justified reason. The rasterizer is a stable, compiled dependency. Changes here require recompilation and can introduce hard-to-debug rendering artifacts.
+3. **Do NOT alter the COLMAP data structure or dataset reader conventions.** The `scene/dataset_readers.py` loader assumes standard COLMAP output (cameras.bin, images.bin, points3D.bin) and an optional `masks/` folder paired by basename. Deviations break data loading for all scenes.
+4. **When modifying loss functions or training schedules, monitor BOTH mIoU and PSNR.** A change that boosts segmentation accuracy but collapses RGB quality is not acceptable.
+5. **mIoU is the PRIMARY metric; PSNR is the GUARDRAIL metric.** Optimize for segmentation IoU first, but do not allow PSNR to degrade significantly below the no-segmentation baseline.
+6. **Do NOT trade RGB reconstruction quality for semantic performance.** Semantic gains achieved by destroying geometry (e.g., allowing densification to run unchecked, weakening opacity regularization) are invalid. If PSNR drops sharply, the modification is harmful regardless of mIoU improvement.
+7. **VERIFY BEFORE REPORTING**: For any metric evaluation, confirm mask format (0/1 vs 0/255), train/test split, and metric implementation before reporting numbers. Flag discrepancies rather than silently using defaults.
+
+## Evaluation Notes
+
+### Train vs Test Evaluation Sample Size
+
+In `train.py:training_report()`, the evaluation sample sizes differ significantly:
+- **Train set**: Only **5 cameras** are evaluated (`range(5, 30, 5)`)
+- **Test set**: All **67 cameras** are evaluated
+
+This means **train mIoU is not directly comparable to test mIoU** due to sample size difference. A small train mIoU gap does NOT mean the model generalizes well—use test mIoU as the ground truth.
+
+### MyVideo Evaluation (Human Annotations)
+
+To evaluate on `myvideo` (human-annotated masks):
+```bash
+python eval_myvideo.py -m outputs/<exp_name> --iteration 30000
+```
+
+This renders the trained model on myvideo's 37 images and computes IoU against human annotations. Expect lower mIoU than SAM-test due to label noise (SAM vs Human IoU = 0.62).
+
+## Debugging Guide
+
+### Training Loss Becomes NaN
+1. Check mask format: masks should be 0/255 (binary), not 0/1
+2. Check GPU/CPU tensor mismatches in loss computation
+3. Check `focal_alpha` value—values too high/low can cause numerical instability
+4. Check densification parameters if point count is exploding
+
+### Test mIoU High but MyVideo mIoU Low
+This is the **label shift** problem (SAM noise), not traditional overfitting:
+- Lower `mask_weight` (0.05-0.1)
+- Add label smoothing
+- Check SAM vs Human mask overlap on specific failure cases
+
+### PSNR Gap > 3 dB (Geometry Degradation)
+- Reduce `mask_weight` (try 0.1 instead of 0.2)
+- Ensure `focal_alpha=0.25` (not 0.75)
+- Reduce `knn_weight` (try 0.02 instead of 0.05)
+- Consider `update_until=0` to disable densification
+
+### seg_only Mode Fails (mIoU < 0.1)
+This is a known issue—`seg_only` (two-stage, freeze geometry) consistently underperforms joint training. Prefer joint training with controlled semantic loss weight.
 
 ## Notable Implementation Details
 

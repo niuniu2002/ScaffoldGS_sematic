@@ -92,12 +92,14 @@ class GaussianModel:
                  add_color_dist : bool = False,
                  use_per_gaussian_seg : bool = False,
                  num_classes : int = 1,
+                 no_opacity_detach : bool = False,
                  ):
 
         self.feat_dim = feat_dim
         self.n_offsets = n_offsets
         self.use_per_gaussian_seg = use_per_gaussian_seg
         self.num_classes = num_classes
+        self.no_opacity_detach = no_opacity_detach
         self.voxel_size = voxel_size
         self.update_depth = update_depth
         self.update_init_factor = update_init_factor
@@ -355,7 +357,9 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
+        # [超大场景适配] 限制初始 scale 上限，避免 rasterizer 数值溢出
+        # spatial_lr_scale=463 时，初始最大 scale 可达 60m，导致渲染 NaN
+        scales = torch.clamp_max(torch.log(torch.sqrt(dist2)), 2.5)[...,None].repeat(1, 6)
         
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -464,6 +468,14 @@ class GaussianModel:
                                                                 lr_final=training_args.appearance_lr_final,
                                                                 lr_delay_mult=training_args.appearance_lr_delay_mult,
                                                                 max_steps=training_args.appearance_lr_max_steps)
+        # [exp_autoresearch_segLR] Segmentation head LR scheduler:
+        #   decay from 0.001 to 0.0001, starting at iteration 7000,
+        #   reaching final LR by iteration 15000.
+        seg_lr_max_steps = 15000
+        self.mlp_segmentation_scheduler_args = get_expon_lr_func(lr_init=0.001,
+                                                                  lr_final=0.0001,
+                                                                  lr_delay_mult=0.01,
+                                                                  max_steps=seg_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -489,6 +501,9 @@ class GaussianModel:
                 param_group['lr'] = lr
             if self.appearance_dim > 0 and name == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if name == "mlp_segmentation":
+                lr = self.mlp_segmentation_scheduler_args(iteration)
                 param_group['lr'] = lr
             
             
@@ -802,7 +817,39 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
-        
+
+        n_anchors = self.get_anchor.shape[0]
+        n_visible_anchors = int(offset_mask.view(-1, self.n_offsets).any(dim=1).sum().item())
+        n_grow_candidates = int(offset_mask.sum().item())
+
+        # --- [Task 5] Log: anchor visibility stats (no logic change) ---
+        # Foreground ratio: use current segmentation head prediction on anchor features
+        fg_ratio = -1.0
+        try:
+            with torch.no_grad():
+                seg_logits = self.get_anchor_seg_logits_raw()  # [N] or [N, C]
+                if self.num_classes == 1:
+                    fg_prob = torch.sigmoid(seg_logits)
+                    fg_ratio = float(fg_prob.mean().item())
+                else:
+                    seg_prob = torch.softmax(seg_logits, dim=-1)
+                    # class 0 = background, classes 1+ = foreground
+                    fg_ratio = float((1.0 - seg_prob[:, 0]).mean().item())
+        except Exception as e:
+            pass  # segmentation head may not be ready during early iterations
+
+        print(f"[Densify] anchors={n_anchors}, visible={n_visible_anchors}, "
+              f"grow_candidates={n_grow_candidates}, fg_ratio={fg_ratio:.4f}")
+
+        # [Task 5] Semantic error access point:
+        # If we had per-anchor semantic error (e.g., rendered mask error projected back to 3D),
+        # it would be available here as an additional criterion for anchor_growing.
+        # Currently this data path does not exist — it would require:
+        #   1. Rendering the mask for the current view in train.py
+        #   2. Back-projecting per-pixel error to visible anchors
+        #   3. Passing anchor_sem_error into adjust_anchor()
+        # See design doc: /mnt/data/liufengyang/data/Scaffold-GSLFY/docs/foreground_aware_anchor_growing.md
+
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
         
         # update offset_denom
@@ -821,7 +868,10 @@ class GaussianModel:
         # # prune anchors
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
-        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N]
+        n_prune = int(prune_mask.sum().item())
+        print(f"[Densify] prune_candidates={n_prune} (opacity < {min_opacity})")
+
         
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
@@ -849,7 +899,9 @@ class GaussianModel:
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
-        
+
+        n_after = self.get_anchor.shape[0]
+        print(f"[Densify] after: anchors={n_after} (delta={n_after - n_anchors:+d})")
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite

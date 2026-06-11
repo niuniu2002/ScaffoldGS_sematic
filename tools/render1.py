@@ -41,18 +41,18 @@ except Exception as e:
     pass
 
 # --- [新增] 创建半透明叠加图的核心函数 ---
-def create_semantic_overlay(rgb_image, semantic_map, alpha=0.6, threshold=0.5):
+def create_semantic_overlay(rgb_image, semantic_map, alpha=0.6, threshold=0.5, num_classes=1):
     """
-    创建一个半透明的橙红色掩码覆盖在 RGB 图像上。
+    创建一个半透明的语义掩码覆盖在 RGB 图像上。
     rgb_image: [3, H, W], 原始 RGB 图像
-    semantic_map: [1, H, W], 语义输出 (logits)
+    semantic_map: [1, H, W] logits (binary) or [C, H, W] logits (multi-class)
     alpha: 掩码透明度 (0.0 - 1.0), 越大越不透明
-    threshold: 判定为目标的阈值 (0.0 - 1.0)
+    threshold: 判定为目标的阈值 (0.0 - 1.0)，仅用于二分类
+    num_classes: 1=binary (sigmoid+threshold), >1=multi-class (softmax+argmax)
     """
     if semantic_map is None:
         return rgb_image
 
-    # 把 semantic_map 转为 tensor，在 CPU/GPU 上都可用
     sem = semantic_map.detach()
 
     # 增加调试输出，方便定位语义图是否恒定
@@ -60,32 +60,45 @@ def create_semantic_overlay(rgb_image, semantic_map, alpha=0.6, threshold=0.5):
         smin = float(torch.min(sem))
         smax = float(torch.max(sem))
         smean = float(torch.mean(sem))
-        print(f"[render] semantic_map stats: min={smin:.6f}, max={smax:.6f}, mean={smean:.6f}")
+        print(f"[render] semantic_map stats: min={smin:.6f}, max={smax:.6f}, mean={smean:.6f}, num_classes={num_classes}")
     except Exception:
         pass
 
-    # 兼容两种输入：已经是概率 (0-1) 或 raw logits
-    if sem.max() <= 1.0 and sem.min() >= 0.0:
-        prob = sem
+    if num_classes == 1:
+        # 二分类：sigmoid + threshold
+        if sem.max() <= 1.0 and sem.min() >= 0.0:
+            prob = sem
+        else:
+            prob = torch.sigmoid(sem)
+        mask = (prob > threshold).float()
+        if mask.dim() == 3 and mask.size(0) == 1:
+            mask = mask.squeeze(0)
+        color = torch.tensor([1.0, 0.3, 0.0], device=rgb_image.device, dtype=rgb_image.dtype).view(3, 1, 1)
+        mask3 = mask.unsqueeze(0).repeat(3, 1, 1)
+        overlay = color * mask3
+        out = rgb_image * (1.0 - alpha * mask3) + overlay * (alpha * mask3)
+        return torch.clamp(out, 0.0, 1.0)
     else:
-        prob = torch.sigmoid(sem)
-
-    # 生成二值掩码 (Binary Mask)
-    mask = (prob > threshold).float()
-
-    # 目标颜色 (橙红色 RGB: 1.0, 0.3, 0.0)
-    color = torch.tensor([1.0, 0.3, 0.0], device=rgb_image.device, dtype=rgb_image.dtype).view(3, 1, 1)
-
-    # 兼容形状 [1,H,W] 或 [H,W]
-    if mask.dim() == 3 and mask.size(0) == 1:
-        mask = mask.squeeze(0)
-
-    # 扩展为三通道并做 alpha 混合：仅在 mask==1 的地方叠加颜色
-    mask3 = mask.unsqueeze(0).repeat(3, 1, 1)
-    overlay = color * mask3
-    out = rgb_image * (1.0 - alpha * mask3) + overlay * (alpha * mask3)
-    out = torch.clamp(out, 0.0, 1.0)
-    return out
+        # 多分类：直接对 logits 做 argmax（argmax(logits) == argmax(softmax(logits))）
+        # 每个非背景类用不同颜色叠加
+        pred_labels = sem.argmax(dim=0)  # [H, W]
+        palette = torch.tensor([
+            [0.0, 0.0, 0.0],      # class 0: no overlay
+            [1.0, 0.3, 0.0],      # class 1: orange-red
+            [0.0, 0.6, 1.0],      # class 2: sky blue
+            [0.2, 0.8, 0.2],      # class 3: green
+            [1.0, 0.0, 1.0],      # class 4: magenta
+            [1.0, 0.8, 0.0],      # class 5: yellow
+        ], device=rgb_image.device, dtype=rgb_image.dtype)
+        if num_classes > palette.shape[0]:
+            extra = num_classes - palette.shape[0]
+            rand_colors = torch.rand(extra, 3, device=rgb_image.device, dtype=rgb_image.dtype)
+            palette = torch.cat([palette, rand_colors], dim=0)
+        overlay_rgb = palette[pred_labels].permute(2, 0, 1)  # [3, H, W]
+        fg_mask = (pred_labels > 0).float()  # [H, W]
+        mask3 = fg_mask.unsqueeze(0).repeat(3, 1, 1)
+        out = rgb_image * (1.0 - alpha * mask3) + overlay_rgb * (alpha * mask3)
+        return torch.clamp(out, 0.0, 1.0)
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, render_semantic=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -126,7 +139,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                     break
 
             if sem_out is not None:
-                overlay_vis = create_semantic_overlay(rendering, sem_out, alpha=0.6, threshold=0.5)
+                overlay_vis = create_semantic_overlay(rendering, sem_out, alpha=0.6, threshold=0.5, num_classes=gaussians.num_classes)
                 # 保存到 overlay 文件夹
                 torchvision.utils.save_image(overlay_vis, os.path.join(overlay_path, '{0:05d}'.format(idx) + ".png"))
 

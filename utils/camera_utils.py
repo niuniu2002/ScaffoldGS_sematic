@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -11,19 +11,20 @@
 
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 import torch
-import torch.nn.functional as F
+from tqdm import tqdm
+import os
 
 WARNED = False
+
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
+    else:
         if args.resolution == -1:
             if orig_w > 1600:
                 global WARNED
@@ -40,47 +41,50 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    # Lazy loading: pass paths/resolution only.  Actual PIL resize and tensor creation
+    # happen on first property access inside Camera to avoid H20 CUDA allocator crash
+    # during bulk camera list loading.
+    semantic_mask_path = None
+    if getattr(cam_info, "semantic_mask", None) is not None:
+        scene_root = os.path.dirname(os.path.dirname(cam_info.image_path))
+        mask_path_png = os.path.join(scene_root, "masks", cam_info.image_name + ".png")
+        mask_path_jpg = os.path.join(scene_root, "masks", cam_info.image_name + ".jpg")
+        semantic_mask_path = mask_path_png if os.path.exists(mask_path_png) else mask_path_jpg
+        if not os.path.exists(semantic_mask_path):
+            semantic_mask_path = None
 
-    gt_image = resized_image_rgb[:3, ...]
-    loaded_mask = None
-
-    # print(f'gt_image: {gt_image.shape}')
-    if resized_image_rgb.shape[1] == 4:
-        loaded_mask = resized_image_rgb[3:4, ...]
-
-    # 语义 mask：从 CameraInfo 中读取，并缩放到当前分辨率
-    semantic_mask = getattr(cam_info, "semantic_mask", None)
-    if semantic_mask is not None:
-        # semantic_mask: [1, H_orig, W_orig] -> 按当前分辨率缩放
-        # F.interpolate 需要 [N, C, H, W]
-        sm = semantic_mask.unsqueeze(0)  # [1, 1, H, W]
-        sm = F.interpolate(sm, size=(resolution[1], resolution[0]), mode="nearest")
-        semantic_mask = sm.squeeze(0)    # 回到 [1, H_res, W_res]
-
-    # 语义权重图：从 CameraInfo 中读取，并缩放到当前分辨率
-    semantic_weight = getattr(cam_info, "semantic_weight", None)
-    if semantic_weight is not None:
-        sw = semantic_weight.unsqueeze(0)  # [1, 1, H, W]
-        # 使用 bilinear 插值保持概率连续性
-        sw = F.interpolate(sw, size=(resolution[1], resolution[0]), mode="bilinear", align_corners=False)
-        semantic_weight = sw.squeeze(0)    # 回到 [1, H_res, W_res]
+    semantic_weight_path = None
+    if getattr(cam_info, "semantic_weight", None) is not None:
+        scene_root = os.path.dirname(os.path.dirname(cam_info.image_path))
+        weight_path_png = os.path.join(scene_root, "semantic_weights", cam_info.image_name + ".png")
+        weight_path_jpg = os.path.join(scene_root, "semantic_weights", cam_info.image_name + ".jpg")
+        semantic_weight_path = weight_path_png if os.path.exists(weight_path_png) else weight_path_jpg
+        if not os.path.exists(semantic_weight_path):
+            semantic_weight_path = None
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY,
-                  image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id,
+                  image_path=cam_info.image_path,
+                  resolution=resolution,
                   data_device=args.data_device,
-                  semantic_mask=semantic_mask,
-                  semantic_weight=semantic_weight)
+                  semantic_mask_path=semantic_mask_path,
+                  semantic_weight_path=semantic_weight_path)
+
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
 
-    for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+    for id, c in enumerate(tqdm(cam_infos, desc="Loading Cameras")):
+        try:
+            cam = loadCam(args, id, c, resolution_scale)
+            camera_list.append(cam)
+        except Exception as e:
+            print(f"\n[ERROR] Failed to load camera {id} ({c.image_name}): {e}")
+            raise
 
     return camera_list
+
 
 def camera_to_JSON(id, camera : Camera):
     Rt = np.zeros((4, 4))
@@ -103,5 +107,3 @@ def camera_to_JSON(id, camera : Camera):
         'fx' : fov2focal(camera.FovX, camera.width)
     }
     return camera_entry
-
-

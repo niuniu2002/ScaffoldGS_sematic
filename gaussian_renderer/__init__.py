@@ -48,11 +48,20 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # per-anchor segmentation confidence
     # Detach to avoid segmentation supervision pulling shared features (which can hurt RGB reconstruction).
-    segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, num_classes] or [N, num_classes*K]
-    if pc.num_classes == 1:
-        segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+    # 兼容 JIT traced 模型：JIT trace 只捕获默认 forward 路径，不支持 return_logit 参数。
+    if getattr(pc, 'mlp_segmentation_is_jit', False):
+        segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, C] prob
+        if pc.num_classes == 1:
+            segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+        else:
+            segmentation_anchor_logit = torch.log(segmentation_anchor.clamp(min=1e-7))
     else:
-        segmentation_anchor_logit = pc.mlp_segmentation(feat.detach(), return_logit=True)
+        if pc.num_classes == 1:
+            segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, 1] prob
+            segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+        else:
+            segmentation_anchor_logit = pc.mlp_segmentation(feat.detach(), return_logit=True)  # [N, C] logit
+            segmentation_anchor = torch.softmax(segmentation_anchor_logit, dim=-1)
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
@@ -136,9 +145,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation, seg_logits_masked, anchor_idx_masked
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, iteration=-1, opacity_grad_until=-1, skip_mask=False):
     """
-    Render the scene. 
+    Render the scene.
+    skip_mask: if True, skip the 128-channel semantic mask pass (saves ~50% time during geometry-only phase).
     """
     is_training = pc.get_color_mlp.training
         
@@ -187,7 +197,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = rot,
         cov3D_precomp = None)
 
-    # [修改点3] 强制执行语义掩码光栅化 (移除 if is_training 判断)
+    # [修改点3] 语义掩码光栅化
+    # skip_mask=True 时跳过整个 mask pass（纯几何训练阶段加速）
+    if skip_mask:
+        return {"render": rendered_image,
+                "mask": None,
+                "viewspace_points": screenspace_points,
+                "visibility_filter" : radii > 0,
+                "radii": radii,
+                "selection_mask": mask,
+                "neural_opacity": neural_opacity,
+                "scaling": scaling,
+                "opacity": opacity}
+
     # NOTE: Mask pass uses a black background so pixels with no Gaussian coverage
     # render to 0 (matches typical GT masks), independent of dataset white_background.
     # [Feature-3DGS rasterizer] semantic_feature is rendered via its own multi-channel path.
@@ -209,7 +231,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # [关键改进 v5] 使用 semantic_feature 通道直接渲染 mask，不再需要复制3通道的 hack。
     # segmentation: [M, 1] (binary) or [M, num_classes] (multi-class)
-    # 多分类时：rasterizer 传入 logit（保证 alpha-blend 后 softmax 有意义），
+    # 多分类时：rasterizer 必须传入 probability（alpha-blend 对 logits 无意义，
+    # weighted average of logits != logit of weighted average）。
     # 二分类时：保持传入 probability（与现有 BCE/focal loss 兼容）。
     # CUDA rasterizer 要求 semantic_feature 的通道数必须严格等于 NUM_SEMANTIC_CHANNELS (128)，
     # 因此需要将 [M, C] pad 到 [M, 128]，渲染后再切回前 C 个通道。
@@ -217,7 +240,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if pc.num_classes == 1:
         seg_feature = segmentation  # [M, 1] probabilities
     else:
-        seg_feature = seg_logits_masked  # [M, C] logits
+        seg_feature = torch.softmax(seg_logits_masked, dim=-1)  # [M, C] probabilities
+    # 保存原始的通道数，用于后续切片（padding 后 shape 会变为 128）
+    orig_seg_ch = seg_feature.shape[1]
     if seg_feature.shape[1] < NUM_SEMANTIC_CHANNELS:
         pad = torch.zeros(seg_feature.shape[0], NUM_SEMANTIC_CHANNELS - seg_feature.shape[1],
                           device=seg_feature.device, dtype=seg_feature.dtype)
@@ -225,24 +250,32 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # [关键改进 v4] 只 detach opacity：
     # 切断 mask loss → opacity → mlp_opacity → feat → RGB 的主要冲突路径。
     # 保留 xyz/scaling/rotation 的梯度，让 mask 仍可通过调整位置/大小来对齐 GT。
+    # --no_opacity_detach 时不做 detach，允许 mask loss 流向 opacity MLP（消融用）
+    # --opacity_grad_until > 0 时：iteration < threshold 则允许梯度，之后 detach（动态门控）
+    use_no_detach = getattr(pc, 'no_opacity_detach', False)
+    if use_no_detach and opacity_grad_until > 0 and iteration >= 0:
+        allow_grad = iteration < opacity_grad_until
+        mask_opacities = opacity if allow_grad else opacity.detach()
+    else:
+        mask_opacities = opacity if use_no_detach else opacity.detach()
     _, rendered_mask_feature, _, _ = rasterizer_mask(
         means3D = xyz,
         means2D = screenspace_points,
         shs = None,
         colors_precomp = torch.zeros_like(color),  # dummy colors for mask pass
         semantic_feature = seg_feature,
-        opacities = opacity.detach(),
+        opacities = mask_opacities,
         scales = scaling,
         rotations = rot,
         cov3D_precomp = None,
     )
-    # rendered_mask_feature: [NUM_SEMANTIC_CHANNELS, H, W] or [C, H, W]
+    # rendered_mask_feature: [NUM_SEMANTIC_CHANNELS, H, W]
     # For binary: take the first channel [1, H, W]
     # For multi-class: take all C channels [C, H, W]
-    if seg_feature.shape[1] == 1:
+    if orig_seg_ch == 1:
         rendered_mask = rendered_mask_feature[0:1, :, :]
     else:
-        rendered_mask = rendered_mask_feature[:seg_feature.shape[1], :, :]
+        rendered_mask = rendered_mask_feature[:orig_seg_ch, :, :]
 
     # [修改点4] 始终返回包含 mask 的完整字典
     return {"render": rendered_image,

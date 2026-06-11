@@ -40,7 +40,9 @@ def generate_semantic_weights(
     image_dir='/mnt/data/liufengyang/data/myvideo/images',
     output_dir='/mnt/data/liufengyang/data/myvideo/semantic_weights',
     device='cuda:0',
+    num_classes=2,
 ):
+    assert num_classes == 2, f"[WARNING] generate_semantic_weights_m2f.py currently only supports binary segmentation (num_classes=2). Got num_classes={num_classes}. Please adapt fg_prob = probs[1] for multi-class."
     os.makedirs(output_dir, exist_ok=True)
 
     # Init model

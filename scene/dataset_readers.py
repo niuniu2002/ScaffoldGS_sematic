@@ -83,7 +83,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, mask_mode="auto"):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -116,7 +116,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         # print(f'FovX: {FovX}, FovY: {FovY}')
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
+        image_name = Path(image_path).stem
         image = Image.open(image_path)
 
         # -------------------------
@@ -140,6 +140,19 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
             # 对于二分类 mask (0/255)，后续在 train.py 中按需除以 255
             # 对于多分类 mask (0,1,2,...)，直接作为类别标签使用
             loaded_mask_np = np.array(mask_pil)
+            # mask_mode: "auto" | "binary" | "multiclass"
+            if mask_mode == "binary":
+                # Force 0/255 -> 0/1 conversion
+                if loaded_mask_np.max() > 1:
+                    loaded_mask_np = (loaded_mask_np > 0).astype(np.uint8)
+            elif mask_mode == "multiclass":
+                # Keep as-is (class ids and 255 ignore_index preserved)
+                pass
+            else:  # "auto"
+                # Detect binary 0/255 and convert to 0/1
+                unique_vals = np.unique(loaded_mask_np)
+                if np.array_equal(unique_vals, [0, 255]) or (len(unique_vals) == 2 and unique_vals.min() == 0 and unique_vals.max() == 255):
+                    loaded_mask_np = loaded_mask_np // 255
             loaded_mask = torch.from_numpy(loaded_mask_np)
             if len(loaded_mask.shape) == 3:
                 loaded_mask = loaded_mask[:, :, 0]  # 取单通道
@@ -186,7 +199,10 @@ def fetchPly(path):
         colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     except:
         colors = np.random.rand(positions.shape[0], positions.shape[1])
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    try:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    except ValueError:
+        normals = np.zeros_like(positions)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -206,7 +222,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+def readColmapSceneInfo(path, images, eval, lod, llffhold=8, mask_mode="auto"):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -219,7 +235,7 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), mask_mode=mask_mode)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
@@ -355,7 +371,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 break
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png", ply_path=None):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", ply_path=None, mask_mode="auto"):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")

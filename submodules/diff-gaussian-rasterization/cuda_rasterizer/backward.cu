@@ -560,22 +560,27 @@ renderCUDA(
 			last_depth = c_d;
 			dL_dalpha += (c_d - accum_depth_rec) * dL_depth;
 
-			for (int ch = 0; ch < NUM_SEMANTIC_CHANNELS; ch++)
+			if (semantic_feature != nullptr)
 			{
-				const float f = collected_semantic_feature[ch * BLOCK_SIZE + j];
-				// Update last semantic feature (to be used in the next iteration)
-				accum_semantic_feature_rec[ch] = last_alpha * last_semantic_feature[ch] + (1.f - last_alpha) * accum_semantic_feature_rec[ch];
-				last_semantic_feature[ch] = f;
+				for (int ch = 0; ch < NUM_SEMANTIC_CHANNELS; ch++)
+				{
+					const float f = semantic_feature[global_id * NUM_SEMANTIC_CHANNELS + ch];
+					// Update last semantic feature (to be used in the next iteration)
+					accum_semantic_feature_rec[ch] = last_alpha * last_semantic_feature[ch] + (1.f - last_alpha) * accum_semantic_feature_rec[ch];
+					last_semantic_feature[ch] = f;
 
-				const float dL_dfeaturechannel = dL_dfeaturepixel[ch];
-				/**************************************************************************************************/
-				// dL_dalpha += (f - accum_semantic_feature_rec[ch]) * dL_dfeaturechannel; // Only works for semnatic-meaning feature. Disable this line for general features.
-				/**************************************************************************************************/
+					const float dL_dfeaturechannel = dL_dfeaturepixel[ch];
+					/**************************************************************************************************/
+					// Enable alpha gradient from semantic_feature for segmentation mask alignment.
+					// (RGB passes skip this loop because semantic_feature is null/empty.)
+					dL_dalpha += (f - accum_semantic_feature_rec[ch]) * dL_dfeaturechannel;
+					/**************************************************************************************************/
 
-				// Update the gradients w.r.t. semnatic feature of the Gaussian.
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dsemantic_feature[global_id * NUM_SEMANTIC_CHANNELS + ch]), dchannel_dsemantic_feature * dL_dfeaturechannel);
+					// Update the gradients w.r.t. semnatic feature of the Gaussian.
+					// Atomic, since this pixel is just one of potentially
+					// many that were affected by this Gaussian.
+					atomicAdd(&(dL_dsemantic_feature[global_id * NUM_SEMANTIC_CHANNELS + ch]), dchannel_dsemantic_feature * dL_dfeaturechannel);
+				}
 			}
 
 			dL_dalpha *= T;

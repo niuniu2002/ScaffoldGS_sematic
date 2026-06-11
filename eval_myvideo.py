@@ -17,7 +17,7 @@ from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams
 
 
-def evaluate_on_myvideo(model_path, source_path, iteration, white_background=False, appearance_dim=32, use_per_gaussian_seg=False, num_classes=1):
+def evaluate_on_myvideo(model_path, source_path, iteration, white_background=False, appearance_dim=32, use_per_gaussian_seg=False, num_classes=1, resolution=-1):
     parser = argparse.ArgumentParser()
     ModelParams(parser)
     arg_list = [
@@ -30,6 +30,8 @@ def evaluate_on_myvideo(model_path, source_path, iteration, white_background=Fal
         arg_list.append('--white_background')
     if use_per_gaussian_seg:
         arg_list.append('--use_per_gaussian_seg')
+    if resolution != -1:
+        arg_list.extend(['--resolution', str(resolution)])
     args = parser.parse_args(arg_list)
 
     gaussians = GaussianModel(
@@ -43,6 +45,28 @@ def evaluate_on_myvideo(model_path, source_path, iteration, white_background=Fal
 
     # Load scene (this also loads MLP checkpoints automatically)
     scene = Scene(args, gaussians, load_iteration=iteration, shuffle=False)
+
+    # Replace masks with human-annotated masks if available
+    human_masks_dir = os.path.join(source_path, "masks_human")
+    if os.path.exists(human_masks_dir):
+        print(f"[INFO] Replacing masks with human annotations from {human_masks_dir}")
+        for cam in scene.getTrainCameras() + scene.getTestCameras():
+            human_mask_path = os.path.join(human_masks_dir, cam.image_name + ".png")
+            if os.path.exists(human_mask_path):
+                mask_pil = Image.open(human_mask_path)
+                if mask_pil.size != (cam.width, cam.height):
+                    mask_pil = mask_pil.resize((cam.width, cam.height), Image.NEAREST)
+                mask_np = np.array(mask_pil)
+                # 兼容 0/255 -> 0/1
+                if np.array_equal(np.unique(mask_np), [0, 255]):
+                    mask_np = mask_np // 255
+                mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).long()
+                cam._semantic_mask = mask_tensor
+                cam._semantic_mask_path = human_mask_path
+            else:
+                print(f"[WARNING] No human mask found for {cam.image_name}, keeping original mask")
+    else:
+        print(f"[INFO] No masks_human/ directory found at {human_masks_dir}, using default masks")
 
     # Background
     bg_color = [1, 1, 1] if white_background else [0, 0, 0]
@@ -127,19 +151,27 @@ def evaluate_on_myvideo(model_path, source_path, iteration, white_background=Fal
             # gt_mask: [1, H, W] or [H, W]
             pred_labels = pred_mask.argmax(dim=0)  # [H, W]
             gt_labels = gt_mask_cuda.squeeze(0).long()  # [H, W]
-            if gt_labels.max() > num_classes - 1:
-                gt_labels = (gt_labels > 0).long()
+            ignore_index = 255
+            max_valid = gt_labels[gt_labels != ignore_index].max() if (gt_labels != ignore_index).any() else torch.tensor(0, device=gt_labels.device)
+            if max_valid > num_classes - 1:
+                raise ValueError(
+                    f"Mask contains label {max_valid.item()} which exceeds num_classes-1={num_classes-1}. "
+                    f"Please ensure mask labels are in [0, {num_classes-1}] or use {ignore_index} as ignore_index."
+                )
 
             iou_per_class = []
+            valid_mask = gt_labels != ignore_index
+            pred_valid = pred_labels[valid_mask]
+            gt_valid = gt_labels[valid_mask]
             for c in range(num_classes):
-                p_c = (pred_labels == c).float()
-                g_c = (gt_labels == c).float()
+                p_c = (pred_valid == c).float()
+                g_c = (gt_valid == c).float()
                 inter = (p_c * g_c).sum().item()
                 union = p_c.sum().item() + g_c.sum().item() - inter
-                iou_c = inter / (union + 1e-8)
-                iou_per_class.append(iou_c)
+                if union > 0:
+                    iou_per_class.append(inter / (union + 1e-8))
 
-            miou = np.mean(iou_per_class)
+            miou = np.mean(iou_per_class) if iou_per_class else 0.0
             result = {
                 'image': viewpoint.image_name,
                 'miou': miou,
@@ -169,9 +201,11 @@ def evaluate_on_myvideo(model_path, source_path, iteration, white_background=Fal
         for r in results:
             print(f"{r['image']:<25} {r['psnr']:>8.2f} {r['iou_bg']:>8.4f} {r['iou_fg']:>8.4f} {r['miou']:>8.4f} {r['best_iou_fg']:>8.4f} {r['best_thresh']:>8.2f}")
     else:
-        # Print per-class IoU
+        # Print per-class IoU (handle missing classes gracefully)
+        max_classes = max(len(r['iou_per_class']) for r in results)
         for c in range(num_classes):
-            class_iou = np.mean([r['iou_per_class'][c] for r in results])
+            class_ious = [r['iou_per_class'][c] if c < len(r['iou_per_class']) else 0.0 for r in results]
+            class_iou = np.mean(class_ious)
             print(f"Mean IoU class {c} : {class_iou:.4f}")
         print(f"\n{'Image':<25} {'PSNR':>8} {'mIoU':>8}")
         print("-" * 50)
@@ -190,7 +224,8 @@ def evaluate_on_myvideo(model_path, source_path, iteration, white_background=Fal
             f.write(f"Mean FG IoU      : {mean_fg:.4f}\n")
         else:
             for c in range(num_classes):
-                class_iou = np.mean([r['iou_per_class'][c] for r in results])
+                class_ious = [r['iou_per_class'][c] if c < len(r['iou_per_class']) else 0.0 for r in results]
+                class_iou = np.mean(class_ious)
                 f.write(f"Mean IoU class {c} : {class_iou:.4f}\n")
         f.write("\n")
         if num_classes == 1:
@@ -217,22 +252,19 @@ if __name__ == '__main__':
     import sys
     # Support both positional args and argparse-style args
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default='output/dronev4_2_highpsnr')
-    parser.add_argument('--source_path', type=str, default='/mnt/data/liufengyang/data/myvideo')
+    ModelParams(parser)
     parser.add_argument('--iteration', type=int, default=30000)
-    parser.add_argument('--white_background', action='store_true')
-    parser.add_argument('--appearance_dim', type=int, default=32)
-    parser.add_argument('--use_per_gaussian_seg', action='store_true')
     args = parser.parse_args()
     
     model_path = args.model_path
     iteration = args.iteration
 
-    # Read cfg_args to get white_background, appearance_dim, use_per_gaussian_seg
+    # Read cfg_args to get white_background, appearance_dim, use_per_gaussian_seg, num_classes
     cfg_path = os.path.join(model_path, 'cfg_args')
     white_background = False
     appearance_dim = 32
     use_per_gaussian_seg = False
+    num_classes = args.num_classes
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             content = f.read()
@@ -245,15 +277,27 @@ if __name__ == '__main__':
             m = re.search(r'appearance_dim=(\d+)', content)
             if m:
                 appearance_dim = int(m.group(1))
+            # Try to extract num_classes from cfg_args if not explicitly provided (default 1)
+            m_nc = re.search(r'num_classes=(\d+)', content)
+            if m_nc:
+                cfg_num_classes = int(m_nc.group(1))
+                # CLI argument always takes priority over cfg_args
+                # Only use cfg_num_classes if user did not explicitly pass --num_classes
+                # (i.e. args.num_classes is still the default value of 1 AND no --num_classes was given)
+                # argparse default is 1, so we cannot distinguish "default" from "explicit 1".
+                # Policy: user must pass correct --num_classes; we trust CLI args unconditionally.
+                pass
 
     print(f"Model: {model_path}, Iteration: {iteration}")
-    print(f"white_background={white_background}, appearance_dim={appearance_dim}, use_per_gaussian_seg={use_per_gaussian_seg}")
+    print(f"white_background={white_background}, appearance_dim={appearance_dim}, use_per_gaussian_seg={use_per_gaussian_seg}, num_classes={num_classes}")
 
     evaluate_on_myvideo(
         model_path=model_path,
-        source_path='/mnt/data/liufengyang/data/myvideo',
+        source_path=args.source_path,
         iteration=iteration,
         white_background=white_background,
         appearance_dim=appearance_dim,
         use_per_gaussian_seg=use_per_gaussian_seg,
+        num_classes=num_classes,
+        resolution=args.resolution if hasattr(args, 'resolution') else -1,
     )

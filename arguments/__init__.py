@@ -91,6 +91,9 @@ class ModelParams(ParamGroup):
         self.undistorted = False
         self.use_per_gaussian_seg = False
         self.num_classes = 1  # 1=binary(sigmoid), >=2=multi-class(softmax)
+        self.no_opacity_detach = False  # True=mask loss can flow to opacity MLP (ablation)
+        self.mask_mode = "auto"  # "auto" | "binary" | "multiclass". How to interpret mask values.
+                                 # auto: detect 0/255 -> binary; binary: force 0/255 -> 0/1; multiclass: keep as-is
 
         # In the Bungeenerf dataset, we propose to set the following three parameters to True,
         # Because there are enough dist variations.
@@ -246,10 +249,35 @@ class OptimizationParams(ParamGroup):
         self.anchor_soft_decay_end = 15000
         self.anchor_soft_max_samples = 4096
 
+        # --- Mask weight decay schedule (optional) ---
+        # When > 0, linearly decay mask_weight from mask_weight -> mask_weight_final
+        # between mask_decay_start and mask_decay_end. Default -1 = disabled (no decay).
+        self.mask_weight_final = -1.0
+        self.mask_decay_start = -1
+        self.mask_decay_end = -1
+
+        # --- Opacity gradient gating (optional) ---
+        # When > 0, allow mask loss -> opacity MLP gradients ONLY when
+        # iteration < opacity_grad_until. After that, detach opacity in mask pass.
+        # Default -1 = disabled (use no_opacity_detach flag as before).
+        self.opacity_grad_until = -1
+
         # Two-stage training: only optimize segmentation head
         self.seg_only = False
         # Two-stage 模式下保留原始 seg head 权重（不重新初始化深层 MLP）
         self.seg_only_reuse_head = False
+
+        # --- Auto Two-Stage Training (geometry pretraining + semantic fine-tuning) ---
+        self.auto_twostage = False
+        self.geometry_stage_iters = 30_000
+        self.geometry_eval_interval = 1_000
+        self.geometry_patience = 5
+        self.geometry_min_delta = 0.03
+        self.geometry_tie_psnr_delta = 0.1
+        self.semantic_stage_iters = 30_000
+        self.semantic_update_until = 0
+        self.save_best_geometry = True
+        self.best_geometry_dir = "best_geometry"
 
         super().__init__(parser, "Optimization Parameters")
 

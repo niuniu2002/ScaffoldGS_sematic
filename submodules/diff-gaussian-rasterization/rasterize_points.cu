@@ -164,7 +164,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
-  torch::Tensor dL_dsemantic_feature = torch::zeros({P, semantic_feature.size(1), NUM_SEMANTIC_CHANNELS}, means3D.options());
+  // Fix: handle empty semantic_feature (RGB pass) and ensure correct shape for non-empty (mask pass).
+  torch::Tensor dL_dsemantic_feature;
+  torch::Tensor dL_dsemantic_feature_buffer;
+  if (semantic_feature.numel() == 0)
+  {
+      dL_dsemantic_feature = torch::zeros_like(semantic_feature);
+      dL_dsemantic_feature_buffer = torch::zeros({P, NUM_SEMANTIC_CHANNELS}, means3D.options());
+  }
+  else
+  {
+      dL_dsemantic_feature = torch::zeros({P, NUM_SEMANTIC_CHANNELS}, semantic_feature.options());
+      dL_dsemantic_feature_buffer = dL_dsemantic_feature;
+  }
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dcov3D = torch::zeros({P, 6}, means3D.options());
@@ -202,7 +214,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dconic.contiguous().data<float>(),
 	  dL_dopacity.contiguous().data<float>(),
 	  dL_dcolors.contiguous().data<float>(),
-	  dL_dsemantic_feature.contiguous().data<float>(),
+	  dL_dsemantic_feature_buffer.contiguous().data<float>(),
 	  dL_dmeans3D.contiguous().data<float>(),
 	  dL_dcov3D.contiguous().data<float>(),
 	  dL_dsh.contiguous().data<float>(),
