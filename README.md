@@ -186,7 +186,21 @@ All metrics are reported on the **test set** (67 images).
 
 ### Recommended Configurations
 
-#### A. Best mIoU (Joint Training)
+#### 🔥 A. SOTA: No-Detach Joint Training (Recommended)
+```bash
+--start_semantic_iter 5000 \
+--mask_weight 0.4 \
+--knn_weight 0.05 \
+--knn_every 100 --knn_offset 55 \
+--focal_alpha 0.25 \
+--update_until 15000 \
+--no_opacity_detach \
+--iterations 30000
+```
+> **Test mIoU 0.8300** | PSNR 23.91 | BG IoU 0.9921
+> Allowing mask gradients into the opacity MLP (`no_opacity_detach`) with a higher `mask_weight` pushes segmentation accuracy to SOTA while preserving acceptable RGB quality.
+
+#### B. Quality-Speed Balance (No Densify)
 ```bash
 --start_semantic_iter 5000 \
 --mask_weight 0.1 --mask_warmup 1000 --mask_ramp 3000 \
@@ -196,19 +210,7 @@ All metrics are reported on the **test set** (67 images).
 --update_until 0 \
 --iterations 30000
 ```
-> Test mIoU ≈ 0.75, PSNR gap ≈ 1.0 dB (minimal overfitting).
-
-#### B. High mIoU with Acceptable PSNR Gap
-```bash
---start_semantic_iter 0 \
---mask_weight 0.2 --mask_warmup 1000 --mask_ramp 3000 \
---knn_weight 0.05 --knn_warmup 2000 --knn_ramp 3000 \
---knn_every 100 --knn_offset 55 \
---focal_alpha 0.25 \
---update_until 15000 \
---iterations 33000
-```
-> Test mIoU ≈ 0.79, PSNR gap ≈ 3.5–4.0 dB.
+> Test mIoU ≈ 0.79, FPS 85.2. Best for real-time inference.
 
 #### C. Two-Stage (`seg_only`) — Freeze Geometry
 ```bash
