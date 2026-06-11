@@ -2,7 +2,33 @@
 __pycache__/
 data/
 output/
+outputs/
 *.ply
 *.pth
 *.zip
 *.tar.gz
+
+# Build artifacts
+*.so
+*.o
+build/
+dist/
+*.egg-info/
+
+# Backup files
+*.bak
+
+# Logs
+*.log
+nohup.out
+*.out
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+_tmp_*
+EOF
