@@ -509,7 +509,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
                               use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False),
                               num_classes=getattr(dataset, 'num_classes', 1),
-                              no_opacity_detach=getattr(dataset, 'no_opacity_detach', False))
+                              no_opacity_detach=getattr(dataset, 'no_opacity_detach', False),
+                              dual_feature=getattr(dataset, 'dual_feature', False))
     # 如果提供了 load_iteration，则从对应的 point_cloud/iteration_X 加载已有高斯作为初始化
     scene = Scene(dataset, gaussians, load_iteration=load_iteration, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
@@ -537,7 +538,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 num_outputs=seg_outputs,
             ).cuda()
         # Freeze all explicit parameters
-        for attr in ('_anchor', '_offset', '_anchor_feat', '_scaling', '_rotation', '_opacity'):
+        for attr in ('_anchor', '_offset', '_anchor_feat', '_anchor_feat_seg', '_scaling', '_rotation', '_opacity'):
             p = getattr(gaussians, attr, None)
             if p is not None and hasattr(p, 'requires_grad'):
                 p.requires_grad = False
@@ -1480,7 +1481,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
                               use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False),
                               num_classes=getattr(dataset, 'num_classes', 1),
-                              no_opacity_detach=getattr(dataset, 'no_opacity_detach', False))
+                              no_opacity_detach=getattr(dataset, 'no_opacity_detach', False),
+                              dual_feature=getattr(dataset, 'dual_feature', False))
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 

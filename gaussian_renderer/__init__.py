@@ -26,6 +26,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
 
+    # [Dual-Feature] seg branch uses independent _anchor_feat_seg
+    feat_seg = pc._anchor_feat_seg[visible_mask] if pc.dual_feature else feat.detach()
+
     ## get view properties for anchor
     ob_view = anchor - viewpoint_camera.camera_center
     # dist
@@ -33,10 +36,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # view
     ob_view = ob_view / ob_dist
 
-    ## view-adaptive feature
+    ## view-adaptive feature (RGB branch only)
     if pc.use_feat_bank:
         cat_view = torch.cat([ob_view, ob_dist], dim=1)
-        
+
         bank_weight = pc.get_featurebank_mlp(cat_view).unsqueeze(dim=1) # [n, 1, 3]
 
         ## multi-resolution feat
@@ -47,20 +50,20 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         feat = feat.squeeze(dim=-1) # [n, c]
 
     # per-anchor segmentation confidence
-    # Detach to avoid segmentation supervision pulling shared features (which can hurt RGB reconstruction).
+    # Dual-Feature: use feat_seg (independent) instead of feat.detach()
     # 兼容 JIT traced 模型：JIT trace 只捕获默认 forward 路径，不支持 return_logit 参数。
     if getattr(pc, 'mlp_segmentation_is_jit', False):
-        segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, C] prob
+        segmentation_anchor = pc.mlp_segmentation(feat_seg)  # [N, C] prob
         if pc.num_classes == 1:
             segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
         else:
             segmentation_anchor_logit = torch.log(segmentation_anchor.clamp(min=1e-7))
     else:
         if pc.num_classes == 1:
-            segmentation_anchor = pc.mlp_segmentation(feat.detach())  # [N, 1] prob
+            segmentation_anchor = pc.mlp_segmentation(feat_seg)  # [N, 1] prob
             segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
         else:
-            segmentation_anchor_logit = pc.mlp_segmentation(feat.detach(), return_logit=True)  # [N, C] logit
+            segmentation_anchor_logit = pc.mlp_segmentation(feat_seg, return_logit=True)  # [N, C] logit
             segmentation_anchor = torch.softmax(segmentation_anchor_logit, dim=-1)
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]

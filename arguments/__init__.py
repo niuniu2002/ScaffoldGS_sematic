@@ -92,6 +92,7 @@ class ModelParams(ParamGroup):
         self.use_per_gaussian_seg = False
         self.num_classes = 1  # 1=binary(sigmoid), >=2=multi-class(softmax)
         self.no_opacity_detach = False  # True=mask loss can flow to opacity MLP (ablation)
+        self.dual_feature = False       # True=seg branch uses independent _anchor_feat_seg instead of feat.detach()
         self.mask_mode = "auto"  # "auto" | "binary" | "multiclass". How to interpret mask values.
                                  # auto: detect 0/255 -> binary; binary: force 0/255 -> 0/1; multiclass: keep as-is
 
