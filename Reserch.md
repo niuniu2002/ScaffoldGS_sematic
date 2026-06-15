@@ -761,11 +761,37 @@ conda run -n scaffold_gslfy --no-capture-output python train.py \
 3. **opg15_resume 策略失效**：15k 后 detach opacity 在 dronev4_2 上同时损害了 PSNR 和 mIoU，不应采用。
 4. **SW_scenes 前景好**：scene_01 15k 即达到 mIoU 0.9221，大幅超过旧方法，但需要恢复训练并等待完整结果。
 
+### 2026-06-15 重启：scene_01 Dual-Feature + no_opacity_detach
+
+**原因**：原 `20260613_scene_01_dualfeat_nodetach` 在 ~17k 处中断，且 `--save_iterations` 只设了 `30000`，未保留中间 checkpoint，无法恢复。
+
+**新目录**：`outputs/20260615_scene_01_dualfeat_nodetach`
+
+**改动**：`--save_iterations 15000 30000`，确保 15k 保存可恢复 checkpoint。
+
+**命令**：
+
+```bash
+conda run -n scaffold_gslfy --no-capture-output python train.py \
+  -s /mnt/data/liufengyang/data/dataset/SW_scenes/scene_01 \
+  -m outputs/20260615_scene_01_dualfeat_nodetach \
+  --num_classes 1 --eval --resolution 2 --white_background \
+  --no_opacity_detach --dual_feature \
+  --mask_weight 0.2 \
+  --start_semantic_iter 500 --update_until 15000 \
+  --knn_weight 0.02 --knn_every 100 --knn_offset 55 \
+  --focal_alpha 0.25 --focal_gamma 2.0 \
+  --iterations 30000 \
+  --test_iterations 7000 12000 15000 30000 \
+  --save_iterations 15000 30000 \
+  --port 6234
+```
+
+**状态**：已启动并在后台运行（PID 3366699），正在读取 479 个相机，预计 8–10 小时完成 30k。
+
 ### 待跟进事项
 
-- **恢复 `scene_01` 训练**：从 ~17k 处 resume 到 30k，获取最终指标。
-- **重启 `scene_00` / `scene_04`**：因中断较早（4k/5k），需重新启动并跑到 30k。
-- **评估是否继续优化 lfy PSNR gap**：当前 gap 已达 6.49 dB，若需改进，建议尝试冻结 appearance embedding 或降低语义 loss weight。
+- **等待 `scene_01` 30k 最终结果**：预计 15k mIoU ≥ 0.92，30k 最终可能继续小幅提升。
 - 如用户需要，可开启一次 `SCAFFOLD_PROFILE=1` 短实验，量化后期训练各阶段耗时。
 
 ### 2026-06-15 今日工作记录
@@ -777,5 +803,6 @@ conda run -n scaffold_gslfy --no-capture-output python train.py \
    - `lfy_dualfeat_nodetach` 完成，mIoU 与单一 nodetach 基本持平。
    - `scene_01` 15k 已达 0.9221 mIoU，但训练在 ~17k 中断。
    - `scene_00` / `scene_04` 在 4k/5k 处中断，需重启。
-4. 更新 `Reserch.md` 跨数据集对比表与待跟进事项。
+4. 因 `scene_01` 未保存中间 checkpoint，无法从 17k 恢复，已从头重新启动新实验 `outputs/20260615_scene_01_dualfeat_nodetach`，并增加 `--save_iterations 15000 30000`。
+5. 更新 `Reserch.md` 并推送至 GitHub。
 
