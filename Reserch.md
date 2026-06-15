@@ -787,11 +787,35 @@ conda run -n scaffold_gslfy --no-capture-output python train.py \
   --port 6234
 ```
 
-**状态**：已启动并在后台运行（PID 3366699），正在读取 479 个相机，预计 8–10 小时完成 30k。
+**状态**：已启动并在后台运行（PID 3366699 / 实际训练 PID 3366777），正在读取 479 个相机，预计 8–10 小时完成 30k。
+
+### 2026-06-15 启动：COB-GS lfy mask finetuning
+
+**目的**：补全 COB-GS 在 `lfy` 上的分割指标。原 `output/lfy_colmap_scene_r2_eval` 只跑了基础 3DGS（`chkpnt30000.pth`），`eval_lfy_test_miou.py` 显示 checkpoint 没有 learned mask field，mIoU 仅 0.023 无效。
+
+**做法**：直接用数据集中已有的 `lfy/colmap_scene/masks/`（Image*.png），从现有 30k checkpoint 启动第二阶段 mask finetuning。
+
+**命令**：
+
+```bash
+cd /mnt/data/liufengyang/data/COB-GS
+conda run -n cobgs --no-capture-output python train.py \
+  -s /mnt/data/liufengyang/data/dataset/lfy/colmap_scene \
+  -m output/lfy_colmap_scene_r2_eval \
+  --start_checkpoint output/lfy_colmap_scene_r2_eval/chkpnt30000.pth \
+  --include_mask --finetune_mask \
+  --N4views 14 \
+  --mask_signals_threshold 0.8
+```
+
+**状态**：已启动并在后台运行（PID 3395636），日志在 `output/lfy_colmap_scene_r2_eval_finetune.log`。
+
+**后续**：训练完成后跑 `eval_lfy_test_miou.py` 获取真实 mIoU，与 Scaffold-GSLFY（0.8771）对比。
 
 ### 待跟进事项
 
 - **等待 `scene_01` 30k 最终结果**：预计 15k mIoU ≥ 0.92，30k 最终可能继续小幅提升。
+- **等待 COB-GS lfy mask finetuning 完成**，获取真实分割指标。
 - 如用户需要，可开启一次 `SCAFFOLD_PROFILE=1` 短实验，量化后期训练各阶段耗时。
 
 ### 2026-06-15 今日工作记录
