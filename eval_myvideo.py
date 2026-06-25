@@ -303,6 +303,13 @@ if __name__ == '__main__':
     print(f"white_background={white_background}, appearance_dim={appearance_dim}, use_per_gaussian_seg={use_per_gaussian_seg}, num_classes={num_classes}")
     print(f"seg_feature_dim={seg_feature_dim}, seg_decoder_hidden={seg_decoder_hidden}, seg_decoder_layers={seg_decoder_layers}, dual_feature={dual_feature}")
 
+    # Fallback to cfg_args source_path if not provided
+    if (not args.source_path or args.source_path == '') and os.path.exists(cfg_path):
+        from argparse import Namespace as _NS
+        with open(cfg_path) as f:
+            cfg_ns = eval(f.read(), {"Namespace": _NS})
+        args.source_path = cfg_ns.source_path
+
     evaluate_on_myvideo(
         model_path=model_path,
         source_path=args.source_path,

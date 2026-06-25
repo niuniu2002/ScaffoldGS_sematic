@@ -229,6 +229,53 @@ lost due to disk migration; need rerun
 - 当前 ours 在 `dronev4_2`（SAM-test）上领先；`lfy` 上 Gaussian Grouping 用 hold-out 训练后降到 0.862，ours 0.877 反超。
 - **所有 benchmark 训练必须加 `--eval`（或对应方法的标准 hold-out 配置）**，确保测试集不参与训练。之前 `output/lfy` 的 0.912 因为训练时可能用了测试集，不作为公平对照。
 - `scene_01` 中期结果已与 Gaussian Grouping 持平，等 30k 跑完再最终对比。
+
+---
+
+## 2026-06-25: Option A 全量 30k 训练与 densification bug 修复
+
+**背景**: 将 CUDA rasterizer 的 `NUM_SEMANTIC_CHANNELS` 从 128 降到 8，配合 2D 1x1 conv decoder（`seg_feature_dim=8`）完成一次完整 30k 训练，验证收敛性与速度。
+
+**修复的 bug**:
+- `scene/gaussian_model.py` 的 anchor densification 在 `cat_tensors_to_optimizer` / `_prune_anchor_optimizer` 中把 `semantic_decoder` 的多参数 group 当成了可拼接的 anchor 参数，触发 `assert len(group["params"]) == 1`。
+- 解决：在跳过列表中加入 `'decoder' in group['name']`，与 `mlp`/`conv`/`embedding` 保持一致。
+- `eval_myvideo.py` 未从 `cfg_args` 回退 `source_path`，单独运行会报 `Could not recognize scene type!`；已补齐回退逻辑。
+
+**训练配置** (`configs/run_dronev4_2_sota_schedule.sh`):
+- `--resolution 2 --white_background --no_opacity_detach --dual_feature`
+- `--seg_feature_dim 8 --seg_decoder_hidden 64 --seg_decoder_layers 2`
+- `--mask_weight 0.2 --start_semantic_iter 500 --mask_every 5 --update_until 15000`
+- `--schedule_densify_grad_threshold --densify_grad_threshold_final 0.001`
+- `--knn_adaptive ... --knn_weight 0.02 --knn_every 100 --knn_offset 55`
+- `--focal_alpha 0.25 --focal_gamma 2.0`
+
+**输出目录**: `output/20260625_optionA_30k_v2`
+
+**训练速度**:
+- 30k iter 总耗时约 **21 分 30 秒**（16:19 -> 16:40）。
+- 平均约 **20~23 it/s**，语义分支激活后 `mask_loss` 约 **3 ms/iter**。
+
+**SAM-test (67) 指标** (训练内建 `training_report`):
+| Iter | Test PSNR | Test FG IoU | Test binary mIoU |
+|------|----------:|------------:|-----------------:|
+| 7000  | 24.26 | 0.7483 | 0.8679 |
+| 12000 | 24.76 | 0.7652 | 0.8768 |
+| 15000 | 24.80 | 0.7738 | 0.8813 |
+| 30000 | 24.82 | 0.7828 | 0.8860 |
+
+- Train 30000: PSNR 26.29, FG IoU 0.8506, binary mIoU 0.9230。
+- 最终独立 render/eval: PSNR 24.82, SSIM 0.6695, LPIPS 0.3377。
+
+**MyVideo human-anno (37) 指标** (`eval_human_only.py`):
+- Mean PSNR: 23.99
+- Mean mIoU: **0.7922**
+- Mean FG IoU: **0.6044**
+- Mean BG IoU: 0.9799
+
+**观察**:
+- Option A 收敛稳定，SAM-test mIoU 接近之前 Dual-Feature + no_opacity_detach 的 0.892，但 PSNR 略低（24.82 vs 25.10）。
+- 人体标注评估的 FG IoU 0.60 符合 SAM-vs-Human 标签偏移预期（SAM 过分割）。
+- 训练速度非常快，30k 仅 20 分钟出头，说明 8 维语义特征 + 轻量 2D decoder 不会成为训练瓶颈。
 - COB-GS 在 dronev4_2 和 lfy 的 mask finetune 均失败（RGB 崩溃或全前景）。
 - `scene_00`–`scene_08` 和 `Flower_Dataset_Complete` 基本未跑，可作为后续扩展。
 

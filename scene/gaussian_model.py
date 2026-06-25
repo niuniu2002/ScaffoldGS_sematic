@@ -717,6 +717,7 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
+                'decoder' in group['name'] or \
                 'feat_base' in group['name'] or \
                 'embedding' in group['name']:
                 continue
@@ -770,6 +771,7 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
+                'decoder' in group['name'] or \
                 'feat_base' in group['name'] or \
                 'embedding' in group['name']:
                 continue
