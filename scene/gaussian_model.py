@@ -122,6 +122,7 @@ class GaussianModel:
                  seg_feature_dim : int = 8,
                  seg_decoder_hidden : int = 64,
                  seg_decoder_layers : int = 2,
+                 ins_feat_dim : int = 6,
                  ):
 
         self.feat_dim = feat_dim
@@ -133,6 +134,7 @@ class GaussianModel:
         self.seg_feature_dim = seg_feature_dim
         self.seg_decoder_hidden = seg_decoder_hidden
         self.seg_decoder_layers = seg_decoder_layers
+        self.ins_feat_dim = ins_feat_dim
         self.voxel_size = voxel_size
         self.update_depth = update_depth
         self.update_init_factor = update_init_factor
@@ -150,7 +152,8 @@ class GaussianModel:
         self._offset = torch.empty(0)
         self._anchor_feat = torch.empty(0)
         self._anchor_feat_seg = torch.empty(0)
-        
+        self._ins_feat = torch.empty(0)
+
         self.opacity_accum = torch.empty(0)
 
         self._scaling = torch.empty(0)
@@ -422,7 +425,8 @@ class GaussianModel:
         fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
         anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
-        
+        ins_feat = torch.zeros((fused_point_cloud.shape[0], self.ins_feat_dim)).float().cuda()
+
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001)
@@ -442,6 +446,7 @@ class GaussianModel:
             self._anchor_feat_seg = nn.Parameter(anchors_feat.clone().requires_grad_(True))
         else:
             self._anchor_feat_seg = torch.empty(0)
+        self._ins_feat = nn.Parameter(ins_feat.requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
@@ -476,6 +481,7 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
                 {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
+                {'params': [self._ins_feat], 'lr': training_args.feature_lr, "name": "ins_feat"},
             ]
         elif self.appearance_dim > 0:
             l = [
@@ -491,6 +497,7 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
                 {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
+                {'params': [self._ins_feat], 'lr': training_args.feature_lr, "name": "ins_feat"},
             ]
         else:
             l = [
@@ -505,6 +512,7 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
+                {'params': [self._ins_feat], 'lr': training_args.feature_lr, "name": "ins_feat"},
             ]
         # [Option A] Add 2D semantic decoder parameters
         if self.seg_feature_dim > 0 and self.semantic_decoder is not None:
@@ -601,6 +609,9 @@ class GaussianModel:
         if self.dual_feature and self._anchor_feat_seg.numel() > 0:
             for i in range(self._anchor_feat_seg.shape[1]):
                 l.append('f_anchor_feat_seg_{}'.format(i))
+        if self._ins_feat.numel() > 0:
+            for i in range(self._ins_feat.shape[1]):
+                l.append('f_ins_feat_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -614,6 +625,7 @@ class GaussianModel:
         anchor = self._anchor.detach().cpu().numpy()
         normals = np.zeros_like(anchor)
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
+        ins_feat = self._ins_feat.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -621,9 +633,9 @@ class GaussianModel:
 
         if self.dual_feature and self._anchor_feat_seg.numel() > 0:
             anchor_feat_seg = self._anchor_feat_seg.detach().cpu().numpy()
-            attributes = np.concatenate((anchor, normals, offset, anchor_feat, anchor_feat_seg, opacities, scale, rotation), axis=1)
+            attributes = np.concatenate((anchor, normals, offset, anchor_feat, anchor_feat_seg, ins_feat, opacities, scale, rotation), axis=1)
         else:
-            attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
+            attributes = np.concatenate((anchor, normals, offset, anchor_feat, ins_feat, opacities, scale, rotation), axis=1)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
@@ -688,6 +700,17 @@ class GaussianModel:
             self._anchor_feat_seg = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
         else:
             self._anchor_feat_seg = torch.empty(0)
+
+        # Load instance feature if present, otherwise init zeros
+        ins_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_ins_feat_")]
+        if len(ins_feat_names) > 0:
+            ins_feat_names = sorted(ins_feat_names, key=lambda x: int(x.split('_')[-1]))
+            ins_feats = np.zeros((anchor.shape[0], len(ins_feat_names)))
+            for idx, attr_name in enumerate(ins_feat_names):
+                ins_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+            self._ins_feat = nn.Parameter(torch.tensor(ins_feats, dtype=torch.float, device="cuda").requires_grad_(True))
+        else:
+            self._ins_feat = nn.Parameter(torch.zeros((anchor.shape[0], self.ins_feat_dim), dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -812,6 +835,8 @@ class GaussianModel:
         self._anchor_feat = optimizable_tensors["anchor_feat"]
         if self.dual_feature and "anchor_feat_seg" in optimizable_tensors:
             self._anchor_feat_seg = optimizable_tensors["anchor_feat_seg"]
+        if "ins_feat" in optimizable_tensors:
+            self._ins_feat = optimizable_tensors["ins_feat"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -889,6 +914,9 @@ class GaussianModel:
 
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
+                new_ins_feat = self._ins_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.ins_feat_dim])[candidate_mask]
+                new_ins_feat = scatter_max(new_ins_feat, inverse_indices.unsqueeze(1).expand(-1, new_ins_feat.size(1)), dim=0)[0][remove_duplicates]
+
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
                 d = {
@@ -896,6 +924,7 @@ class GaussianModel:
                     "scaling": new_scaling,
                     "rotation": new_rotation,
                     "anchor_feat": new_feat,
+                    "ins_feat": new_ins_feat,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
@@ -920,6 +949,8 @@ class GaussianModel:
                 self._scaling = optimizable_tensors["scaling"]
                 self._rotation = optimizable_tensors["rotation"]
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
+                if "ins_feat" in optimizable_tensors:
+                    self._ins_feat = optimizable_tensors["ins_feat"]
                 if self.dual_feature and "anchor_feat_seg" in optimizable_tensors:
                     self._anchor_feat_seg = optimizable_tensors["anchor_feat_seg"]
                 self._offset = optimizable_tensors["offset"]

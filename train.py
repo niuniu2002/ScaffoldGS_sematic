@@ -530,7 +530,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                               dual_feature=getattr(dataset, 'dual_feature', False),
                               seg_feature_dim=getattr(dataset, 'seg_feature_dim', 0),
                               seg_decoder_hidden=getattr(dataset, 'seg_decoder_hidden', 64),
-                              seg_decoder_layers=getattr(dataset, 'seg_decoder_layers', 2))
+                              seg_decoder_layers=getattr(dataset, 'seg_decoder_layers', 2),
+                              ins_feat_dim=getattr(dataset, 'ins_feat_dim', 6))
     # 如果提供了 load_iteration，则从对应的 point_cloud/iteration_X 加载已有高斯作为初始化
     scene = Scene(dataset, gaussians, load_iteration=load_iteration, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
@@ -1620,7 +1621,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                               dual_feature=getattr(dataset, 'dual_feature', False),
                               seg_feature_dim=getattr(dataset, 'seg_feature_dim', 0),
                               seg_decoder_hidden=getattr(dataset, 'seg_decoder_hidden', 64),
-                              seg_decoder_layers=getattr(dataset, 'seg_decoder_layers', 2))
+                              seg_decoder_layers=getattr(dataset, 'seg_decoder_layers', 2),
+                              ins_feat_dim=getattr(dataset, 'ins_feat_dim', 6))
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 

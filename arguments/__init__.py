@@ -100,6 +100,7 @@ class ModelParams(ParamGroup):
         self.seg_feature_dim = 8
         self.seg_decoder_hidden = 64
         self.seg_decoder_layers = 2
+        self.ins_feat_dim = 6  # per-anchor instance feature dimension (InstanceGaussian-style)
         self.mask_mode = "auto"  # "auto" | "binary" | "multiclass". How to interpret mask values.
                                  # auto: detect 0/255 -> binary; binary: force 0/255 -> 0/1; multiclass: keep as-is
 

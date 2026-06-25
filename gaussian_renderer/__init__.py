@@ -130,6 +130,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # anchor index for each child Gaussian (before opacity masking)
     anchor_idx_all = torch.arange(anchor.shape[0], device=anchor.device).repeat_interleave(pc.n_offsets)  # [N*k]
 
+    # expand per-anchor instance features to per-Gaussian
+    if pc._ins_feat.numel() > 0:
+        ins_features_all = pc._ins_feat[visible_mask].repeat_interleave(pc.n_offsets, dim=0)  # [N*k, ins_feat_dim]
+    else:
+        ins_features_all = torch.empty((anchor.shape[0]*pc.n_offsets, 0), device=anchor.device, dtype=feat.dtype)
+
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
@@ -148,19 +154,21 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # mask seg logits/features and anchor indices for region consistency loss
     seg_logits_masked = seg_logits_all[mask]      # [M, num_seg_ch]
     anchor_idx_masked = anchor_idx_all[mask]       # [M]
+    ins_features_masked = ins_features_all[mask]   # [M, ins_feat_dim]
 
-    return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation, seg_logits_masked, anchor_idx_masked
+    return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation, seg_logits_masked, anchor_idx_masked, ins_features_masked
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, iteration=-1, opacity_grad_until=-1, skip_mask=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, iteration=-1, opacity_grad_until=-1, skip_mask=False, render_instance=False):
     """
     Render the scene.
     skip_mask: if True, skip the 128-channel semantic mask pass (saves ~50% time during geometry-only phase).
+    render_instance: if True, additionally render instance features via the semantic_feature path.
     """
     is_training = pc.get_color_mlp.training
-        
+
     # [修改点2] 始终接收完整返回值
     (xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation,
-     seg_logits_masked, anchor_idx_masked) = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+     seg_logits_masked, anchor_idx_masked, ins_features_masked) = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
 
     # Create zero tensor.
     screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
