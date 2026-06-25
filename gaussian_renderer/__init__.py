@@ -154,6 +154,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # mask seg logits/features and anchor indices for region consistency loss
     seg_logits_masked = seg_logits_all[mask]      # [M, num_seg_ch]
     anchor_idx_masked = anchor_idx_all[mask]       # [M]
+    # [Instance Feature Branch] per-Gaussian instance features after opacity filtering
     ins_features_masked = ins_features_all[mask]   # [M, ins_feat_dim]
 
     return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation, seg_logits_masked, anchor_idx_masked, ins_features_masked
@@ -163,6 +164,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     Render the scene.
     skip_mask: if True, skip the 128-channel semantic mask pass (saves ~50% time during geometry-only phase).
     render_instance: if True, additionally render instance features via the semantic_feature path.
+                     NOTE: the rasterization pass for instance features is not implemented yet;
+                     only the data flow and function signature are wired.
     """
     is_training = pc.get_color_mlp.training
 

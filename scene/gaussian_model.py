@@ -152,6 +152,9 @@ class GaussianModel:
         self._offset = torch.empty(0)
         self._anchor_feat = torch.empty(0)
         self._anchor_feat_seg = torch.empty(0)
+        # [Instance Feature Branch] Per-anchor instance embedding inspired by InstanceGaussian.
+        # Rendered to 2D via the semantic_feature rasterizer path and supervised by
+        # cohesion/separation losses computed on SAM instance masks.
         self._ins_feat = torch.empty(0)
 
         self.opacity_accum = torch.empty(0)
@@ -481,6 +484,7 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
                 {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
+                # [Instance Feature Branch] learnable per-anchor instance embedding
                 {'params': [self._ins_feat], 'lr': training_args.feature_lr, "name": "ins_feat"},
             ]
         elif self.appearance_dim > 0:
@@ -497,6 +501,7 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
                 {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
+                # [Instance Feature Branch] learnable per-anchor instance embedding
                 {'params': [self._ins_feat], 'lr': training_args.feature_lr, "name": "ins_feat"},
             ]
         else:
@@ -512,6 +517,7 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
+                # [Instance Feature Branch] learnable per-anchor instance embedding
                 {'params': [self._ins_feat], 'lr': training_args.feature_lr, "name": "ins_feat"},
             ]
         # [Option A] Add 2D semantic decoder parameters
