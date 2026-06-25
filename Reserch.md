@@ -30,6 +30,53 @@
 
 ---
 
+## 2026-06-25 Instance Feature Branch（InstanceGaussian 风格）
+
+### 改动动机
+- 当前 `Scaffold-GSLFY` 只能做语义分割（前景/背景或多类别），无法区分同一前景类别下的不同实例。
+- 参考 `InstanceGaussian`，引入**per-anchor instance feature** (`_ins_feat`)，通过渲染到 2D 后计算 cohesion/separation loss，使同一实例的 Gaussian 特征相近、不同实例相远，从而支持无人机场景下的实例级三维重建与分割。
+
+### 已完成的改动
+| 文件 | 内容 |
+| --- | --- |
+| `arguments/__init__.py` | 新增 `--ins_feat_dim`（默认 6） |
+| `scene/gaussian_model.py` | `GaussianModel.__init__` 新增 `ins_feat_dim` 参数；创建 `self._ins_feat`；在 `create_from_pcd` 中零初始化并加入优化器；`training_setup` 新增 `ins_feat` 参数组；`construct_list_of_attributes` / `save_ply` / `load_ply_sparse_gaussian` 支持读写；`cat_tensors_to_optimizer` / `_prune_anchor_optimizer` / `prune_anchor` / `anchor_growing` 已兼容 `_ins_feat` 的 densification |
+| `train.py` | 两处 `GaussianModel` 实例化传入 `ins_feat_dim=getattr(dataset, 'ins_feat_dim', 6)` |
+| `gaussian_renderer/__init__.py` | 已开始修改：`generate_neural_gaussians` 返回 `ins_features_masked`；`render()` 新增 `render_instance` 参数用于额外渲染实例特征（进行中，尚未完成训练侧调用与 loss 接入） |
+
+### 当前任务状态
+| 任务 | 状态 | 说明 |
+| --- | --- | --- |
+| 13. Add `_ins_feat` parameter to `GaussianModel` | ✅ 完成 | 已通过 PLY save/load、optimizer group、cat/prune/grow 测试 |
+| 18. Add instance feature rendering pass | 🔄 进行中 | renderer 已返回 `ins_features_masked`，实例光栅化 pass 已接入但未验证端到端 |
+| 14. Generate SAM instance masks for `dronev4_2` | ⏳ 待开始 | 需要为训练图生成 instance mask（同图多实例） |
+| 15. Add cohesion/separation loss and instance mask loading | ⏳ 待开始 | 依赖 task 14/18 |
+| 17. Dry-run verification with single-instance masks | ⏳ 待开始 | 依赖 task 15 |
+| 16. Short training and evaluation with instance masks | ⏳ 待开始 | 依赖 task 14/15/17 |
+
+### 验证结果（本地单元测试）
+- `GaussianModel` 初始化后 `_ins_feat.shape = [N, 6]`，`requires_grad=True`。
+- `training_setup` 后 optimizer 参数组包含 `ins_feat`。
+- `save_ply` / `load_ply_sparse_gaussian` 往返后 `_ins_feat` 数值一致。
+- `cat_tensors_to_optimizer` 对 `ins_feat` 扩展后形状正确（`N+new -> N+new`）。
+
+### 下一步工作
+1. 完成 `render(render_instance=True)` 的端到端验证，确认返回 `instance_features` 形状为 `[ins_feat_dim, H, W]`。
+2. 为 `dronev4_2` 生成 SAM instance masks（同图多实例，避免 SegAnyGAussians 单 mask 退化问题）。
+3. 在 `train.py` 中接入 instance cohesion/separation loss：
+   - 加载 `masks_instance/INSTANCE_ID/` 或单图多通道 instance mask；
+   - 对同 instance mask 内像素计算 feature mean 作为 prototype；
+   - cohesion：mask 内像素特征与 prototype 的 MSE/余弦距离；
+   - separation：不同 instance prototype 之间的余弦距离（push-away）。
+4. 短训 1000-3000 iter 验证 instance feature 是否收敛且不损害 PSNR。
+
+### 注意事项
+- 当前 `NUM_SEMANTIC_CHANNELS=8`（Option A），实例特征单独走一次 `semantic_feature` 光栅化 pass，因此 `ins_feat_dim` 不能超过 8；默认 6 符合限制。
+- 实例 loss 建议每隔 `ins_every` 次迭代计算一次，避免每次迭代都跑额外的光栅化 pass 影响训练速度。
+- 需同时监控 PSNR，确保实例分支不破坏 RGB 重建。
+
+---
+
 ## 2026-06-11 Recovery after Disk Migration
 
 ### 数据丢失范围
