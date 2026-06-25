@@ -28,7 +28,7 @@ from scene.embedding import Embedding
 
 class SegmentationHead(nn.Module):
     """更深的分割头，带残差连接和 LayerNorm。支持二分类(sigmoid)和多分类(softmax)。"""
-    def __init__(self, feat_dim=32, hidden_dim=128, num_layers=3, dropout=0.0, num_outputs=1):
+    def __init__(self, feat_dim=32, hidden_dim=128, num_layers=3, dropout=0.0, num_outputs=1, output_activation='sigmoid'):
         super().__init__()
         self.input_proj = nn.Linear(feat_dim, hidden_dim)
         self.input_norm = nn.LayerNorm(hidden_dim)
@@ -42,6 +42,7 @@ class SegmentationHead(nn.Module):
             ))
         self.logit_head = nn.Linear(hidden_dim, num_outputs)
         self.num_outputs = num_outputs
+        self.output_activation = output_activation  # 'sigmoid' | 'softmax' | 'none'
 
     def forward(self, x, return_logit=False):
         feat = self.input_proj(x)
@@ -52,9 +53,33 @@ class SegmentationHead(nn.Module):
         logit = self.logit_head(feat)
         if return_logit:
             return logit
+        if self.output_activation == 'none':
+            return logit
         if self.num_outputs == 1:
             return torch.sigmoid(logit)
         return torch.softmax(logit, dim=-1)
+
+
+class SemanticDecoder(nn.Module):
+    """Lightweight 2D decoder that maps rendered low-dim semantic features to per-pixel logits.
+
+    Input:  [B, seg_feature_dim, H, W] or [seg_feature_dim, H, W]
+    Output: [B, num_classes, H, W] or [num_classes, H, W] logits
+    """
+    def __init__(self, in_channels=8, hidden_dim=64, num_classes=1, num_layers=2):
+        super().__init__()
+        layers = [nn.Conv2d(in_channels, hidden_dim, kernel_size=1), nn.ReLU(inplace=True)]
+        for _ in range(num_layers):
+            layers += [nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1), nn.ReLU(inplace=True)]
+        layers.append(nn.Conv2d(hidden_dim, num_classes, kernel_size=1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        squeeze = x.dim() == 3
+        if squeeze:
+            x = x.unsqueeze(0)
+        out = self.net(x)
+        return out.squeeze(0) if squeeze else out
 
 
 class GaussianModel:
@@ -94,6 +119,9 @@ class GaussianModel:
                  num_classes : int = 1,
                  no_opacity_detach : bool = False,
                  dual_feature : bool = False,
+                 seg_feature_dim : int = 8,
+                 seg_decoder_hidden : int = 64,
+                 seg_decoder_layers : int = 2,
                  ):
 
         self.feat_dim = feat_dim
@@ -102,6 +130,9 @@ class GaussianModel:
         self.num_classes = num_classes
         self.no_opacity_detach = no_opacity_detach
         self.dual_feature = dual_feature
+        self.seg_feature_dim = seg_feature_dim
+        self.seg_decoder_hidden = seg_decoder_hidden
+        self.seg_decoder_layers = seg_decoder_layers
         self.voxel_size = voxel_size
         self.update_depth = update_depth
         self.update_init_factor = update_init_factor
@@ -171,17 +202,37 @@ class GaussianModel:
 
         # [改进] 更深的语义分割头（3层残差，128 hidden）
         # 多分类支持：per-anchor 输出 num_classes；per-Gaussian 输出 num_classes * n_offsets
-        if self.use_per_gaussian_seg:
-            seg_outputs = self.num_classes * self.n_offsets
+        if self.seg_feature_dim > 0:
+            # Option A: render low-dim semantic features, decode in 2D
+            if self.use_per_gaussian_seg:
+                seg_outputs = self.seg_feature_dim * self.n_offsets
+            else:
+                seg_outputs = self.seg_feature_dim
+            seg_output_activation = 'none'
         else:
-            seg_outputs = self.num_classes
+            if self.use_per_gaussian_seg:
+                seg_outputs = self.num_classes * self.n_offsets
+            else:
+                seg_outputs = self.num_classes
+            seg_output_activation = 'sigmoid'
         self.mlp_segmentation = SegmentationHead(
             feat_dim=self.feat_dim,
             hidden_dim=128,
             num_layers=3,
             dropout=0.0,
             num_outputs=seg_outputs,
+            output_activation=seg_output_activation,
         ).cuda()
+
+        if self.seg_feature_dim > 0:
+            self.semantic_decoder = SemanticDecoder(
+                in_channels=self.seg_feature_dim,
+                hidden_dim=self.seg_decoder_hidden,
+                num_classes=self.num_classes,
+                num_layers=self.seg_decoder_layers,
+            ).cuda()
+        else:
+            self.semantic_decoder = None
 
 
     def eval(self):
@@ -189,6 +240,8 @@ class GaussianModel:
         self.mlp_cov.eval()
         self.mlp_color.eval()
         self.mlp_segmentation.eval()
+        if self.semantic_decoder is not None:
+            self.semantic_decoder.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
@@ -199,9 +252,11 @@ class GaussianModel:
         self.mlp_cov.train()
         self.mlp_color.train()
         self.mlp_segmentation.train()
+        if self.semantic_decoder is not None:
+            self.semantic_decoder.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
-        if self.use_feat_bank:                  
+        if self.use_feat_bank:
             self.mlp_feature_bank.train()
 
     def capture(self):
@@ -329,6 +384,17 @@ class GaussianModel:
         if self.num_classes == 1:
             logit = logit.squeeze(-1)
         return logit
+
+    def get_anchor_seg_features(self):
+        """
+        Option A: 返回每个锚点的低维语义特征，供 KNN Loss 在特征空间使用。
+        输出: [N, seg_feature_dim]；若 use_per_gaussian_seg，则对 offsets 取平均。
+        """
+        feat = self._anchor_feat_seg if self.dual_feature else self._anchor_feat.detach()
+        features = self.mlp_segmentation(feat)  # [N, seg_feature_dim] (raw)
+        if self.use_per_gaussian_seg and features.dim() == 2 and features.shape[1] > self.seg_feature_dim:
+            features = features.view(-1, self.n_offsets, self.seg_feature_dim).mean(dim=1)
+        return features
     
     def voxelize_sample(self, data=None, voxel_size=0.01):
         np.random.shuffle(data)
@@ -440,6 +506,9 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
                 {'params': self.mlp_segmentation.parameters(), 'lr': 0.001, "name": "mlp_segmentation"},
             ]
+        # [Option A] Add 2D semantic decoder parameters
+        if self.seg_feature_dim > 0 and self.semantic_decoder is not None:
+            l.append({'params': self.semantic_decoder.parameters(), 'lr': 0.001, "name": "semantic_decoder"})
         # [Dual-Feature] Add independent seg feature if enabled
         if self.dual_feature and self._anchor_feat_seg.numel() > 0:
             l.append({'params': [self._anchor_feat_seg], 'lr': training_args.feature_lr, "name": "anchor_feat_seg"})
@@ -486,6 +555,11 @@ class GaussianModel:
                                                                   lr_final=0.0001,
                                                                   lr_delay_mult=0.01,
                                                                   max_steps=seg_lr_max_steps)
+        if self.seg_feature_dim > 0 and self.semantic_decoder is not None:
+            self.semantic_decoder_scheduler_args = get_expon_lr_func(lr_init=0.001,
+                                                                      lr_final=0.0001,
+                                                                      lr_delay_mult=0.01,
+                                                                      max_steps=seg_lr_max_steps)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -515,8 +589,9 @@ class GaussianModel:
             if name == "mlp_segmentation":
                 lr = self.mlp_segmentation_scheduler_args(iteration)
                 param_group['lr'] = lr
-            
-            
+            if name == "semantic_decoder" and hasattr(self, 'semantic_decoder_scheduler_args'):
+                lr = self.semantic_decoder_scheduler_args(iteration)
+                param_group['lr'] = lr
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         for i in range(self._offset.shape[1]*self._offset.shape[2]):
@@ -966,6 +1041,13 @@ class GaussianModel:
             seg_mlp.save(os.path.join(path, 'segmentation_mlp.pt'))
             self.mlp_segmentation.train()
 
+            if self.seg_feature_dim > 0 and self.semantic_decoder is not None:
+                self.semantic_decoder.eval()
+                decoder_input = torch.rand(1, self.seg_feature_dim, 64, 64).cuda()
+                semantic_decoder_jit = torch.jit.trace(self.semantic_decoder, decoder_input)
+                semantic_decoder_jit.save(os.path.join(path, 'semantic_decoder.pt'))
+                self.semantic_decoder.train()
+
             if self.use_feat_bank:
                 self.mlp_feature_bank.eval()
                 feature_bank_mlp = torch.jit.trace(self.mlp_feature_bank, (torch.rand(1, 3+1).cuda()))
@@ -979,6 +1061,7 @@ class GaussianModel:
                 self.embedding_appearance.train()
 
         elif mode == 'unite':
+            decoder_state = self.semantic_decoder.state_dict() if (self.seg_feature_dim > 0 and self.semantic_decoder is not None) else None
             if self.use_feat_bank:
                 torch.save({
                     'opacity_mlp': self.mlp_opacity.state_dict(),
@@ -986,7 +1069,8 @@ class GaussianModel:
                     'color_mlp': self.mlp_color.state_dict(),
                     'segmentation_mlp': self.mlp_segmentation.state_dict(),
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
+                    'appearance': self.embedding_appearance.state_dict(),
+                    'semantic_decoder': decoder_state,
                     }, os.path.join(path, 'checkpoints.pth'))
             elif self.appearance_dim > 0:
                 torch.save({
@@ -994,7 +1078,8 @@ class GaussianModel:
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
                     'segmentation_mlp': self.mlp_segmentation.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
+                    'appearance': self.embedding_appearance.state_dict(),
+                    'semantic_decoder': decoder_state,
                     }, os.path.join(path, 'checkpoints.pth'))
             else:
                 torch.save({
@@ -1002,6 +1087,7 @@ class GaussianModel:
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
                     'segmentation_mlp': self.mlp_segmentation.state_dict(),
+                    'semantic_decoder': decoder_state,
                     }, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
@@ -1014,6 +1100,9 @@ class GaussianModel:
             self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
             self.mlp_segmentation = torch.jit.load(os.path.join(path, 'segmentation_mlp.pt')).cuda()
             self.mlp_segmentation_is_jit = True
+            decoder_path = os.path.join(path, 'semantic_decoder.pt')
+            if self.seg_feature_dim > 0 and self.semantic_decoder is not None and os.path.exists(decoder_path):
+                self.semantic_decoder = torch.jit.load(decoder_path).cuda()
             if self.use_feat_bank:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
@@ -1025,6 +1114,8 @@ class GaussianModel:
             self.mlp_color.load_state_dict(checkpoint['color_mlp'])
             if 'segmentation_mlp' in checkpoint:
                 self.mlp_segmentation.load_state_dict(checkpoint['segmentation_mlp'])
+            if self.seg_feature_dim > 0 and self.semantic_decoder is not None and checkpoint.get('semantic_decoder') is not None:
+                self.semantic_decoder.load_state_dict(checkpoint['semantic_decoder'])
             if self.use_feat_bank:
                 self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
             if self.appearance_dim > 0:

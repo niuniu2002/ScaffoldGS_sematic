@@ -27,6 +27,7 @@ from scene import Scene
 from scene.gaussian_model import GaussianModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams
+from train import decode_rendered_mask
 
 
 def focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
@@ -47,7 +48,9 @@ def dice_loss(inputs, targets, smooth=1.0):
 
 def evaluate_with_tta(model_path, source_path, iteration,
                       white_background=False, appearance_dim=32,
-                      tta_iterations=0, tta_lr=1e-4):
+                      tta_iterations=0, tta_lr=1e-4,
+                      seg_feature_dim=8, seg_decoder_hidden=64, seg_decoder_layers=2,
+                      use_per_gaussian_seg=False, num_classes=1, dual_feature=False):
     parser = argparse.ArgumentParser()
     ModelParams(parser)
     args = parser.parse_args([
@@ -63,7 +66,12 @@ def evaluate_with_tta(model_path, source_path, iteration,
         args.update_depth, args.update_init_factor, args.update_hierachy_factor,
         args.use_feat_bank, args.appearance_dim, args.ratio,
         args.add_opacity_dist, args.add_cov_dist, args.add_color_dist,
-        num_classes=getattr(args, 'num_classes', 1)
+        use_per_gaussian_seg=use_per_gaussian_seg,
+        num_classes=num_classes,
+        dual_feature=dual_feature,
+        seg_feature_dim=seg_feature_dim,
+        seg_decoder_hidden=seg_decoder_hidden,
+        seg_decoder_layers=seg_decoder_layers,
     )
     scene = Scene(args, gaussians, load_iteration=iteration, shuffle=False)
 
@@ -103,7 +111,7 @@ def evaluate_with_tta(model_path, source_path, iteration,
                 total_loss = 0.0
                 for viewpoint in cameras_with_mask:
                     render_pkg = render(viewpoint, gaussians, pipe, background)
-                    pred_mask = render_pkg['mask']
+                    pred_mask = decode_rendered_mask(gaussians, render_pkg['mask'])
                     gt_mask = viewpoint.semantic_mask.cuda().float()
 
                     pred = torch.clamp(pred_mask, min=1e-6, max=1.0 - 1e-6)
@@ -132,7 +140,7 @@ def evaluate_with_tta(model_path, source_path, iteration,
 
     for viewpoint in tqdm(all_cameras, desc="Evaluating"):
         render_pkg = render(viewpoint, gaussians, pipe, background)
-        pred_mask = render_pkg['mask']
+        pred_mask = decode_rendered_mask(gaussians, render_pkg['mask'])
 
         gt_mask = getattr(viewpoint, 'semantic_mask', None)
         if gt_mask is None:
@@ -188,7 +196,20 @@ if __name__ == "__main__":
     parser.add_argument("--tta_iterations", type=int, default=0,
                         help="Number of TTA iterations (0 = no TTA)")
     parser.add_argument("--tta_lr", type=float, default=1e-4)
+    parser.add_argument("--seg_feature_dim", type=int, default=8)
+    parser.add_argument("--seg_decoder_hidden", type=int, default=64)
+    parser.add_argument("--seg_decoder_layers", type=int, default=2)
+    parser.add_argument("--use_per_gaussian_seg", action="store_true")
+    parser.add_argument("--num_classes", type=int, default=1)
     args = parser.parse_args()
+
+    dual_feature = False
+    cfg_path = os.path.join(args.model_path, "cfg_args")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            content = f.read()
+        if 'dual_feature=True' in content:
+            dual_feature = True
 
     evaluate_with_tta(
         model_path=args.model_path,
@@ -198,4 +219,10 @@ if __name__ == "__main__":
         appearance_dim=args.appearance_dim,
         tta_iterations=args.tta_iterations,
         tta_lr=args.tta_lr,
+        seg_feature_dim=args.seg_feature_dim,
+        seg_decoder_hidden=args.seg_decoder_hidden,
+        seg_decoder_layers=args.seg_decoder_layers,
+        use_per_gaussian_seg=args.use_per_gaussian_seg,
+        num_classes=args.num_classes,
+        dual_feature=dual_feature,
     )

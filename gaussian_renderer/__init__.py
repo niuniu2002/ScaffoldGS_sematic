@@ -51,20 +51,29 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # per-anchor segmentation confidence
     # Dual-Feature: use feat_seg (independent) instead of feat.detach()
-    # 兼容 JIT traced 模型：JIT trace 只捕获默认 forward 路径，不支持 return_logit 参数。
-    if getattr(pc, 'mlp_segmentation_is_jit', False):
-        segmentation_anchor = pc.mlp_segmentation(feat_seg)  # [N, C] prob
-        if pc.num_classes == 1:
-            segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
-        else:
-            segmentation_anchor_logit = torch.log(segmentation_anchor.clamp(min=1e-7))
+    # Option A: when seg_feature_dim > 0, render low-dim raw features directly.
+    if pc.seg_feature_dim > 0:
+        # 兼容 JIT traced 模型：JIT trace 只捕获默认 forward 路径
+        segmentation_anchor = pc.mlp_segmentation(feat_seg)  # [N, seg_feature_dim] raw
+        segmentation_anchor_logit = segmentation_anchor       # for KNN consistency
+        num_seg_ch = pc.seg_feature_dim
     else:
-        if pc.num_classes == 1:
-            segmentation_anchor = pc.mlp_segmentation(feat_seg)  # [N, 1] prob
-            segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+        # Legacy mode: render class probabilities
+        # 兼容 JIT traced 模型：JIT trace 只捕获默认 forward 路径，不支持 return_logit 参数。
+        if getattr(pc, 'mlp_segmentation_is_jit', False):
+            segmentation_anchor = pc.mlp_segmentation(feat_seg)  # [N, C] prob
+            if pc.num_classes == 1:
+                segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+            else:
+                segmentation_anchor_logit = torch.log(segmentation_anchor.clamp(min=1e-7))
         else:
-            segmentation_anchor_logit = pc.mlp_segmentation(feat_seg, return_logit=True)  # [N, C] logit
-            segmentation_anchor = torch.softmax(segmentation_anchor_logit, dim=-1)
+            if pc.num_classes == 1:
+                segmentation_anchor = pc.mlp_segmentation(feat_seg)  # [N, 1] prob
+                segmentation_anchor_logit = torch.logit(segmentation_anchor.clamp(min=1e-6, max=1-1e-6))
+            else:
+                segmentation_anchor_logit = pc.mlp_segmentation(feat_seg, return_logit=True)  # [N, C] logit
+                segmentation_anchor = torch.softmax(segmentation_anchor_logit, dim=-1)
+        num_seg_ch = pc.num_classes if pc.num_classes > 1 else 1
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
@@ -110,18 +119,13 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     offsets = grid_offsets.view([-1, 3]) # [mask]
 
     # expand per-anchor segmentation to per-Gaussian
-    num_seg_ch = pc.num_classes if pc.num_classes > 1 else 1
     if pc.use_per_gaussian_seg:
-        if pc.num_classes > 1:
-            # [N, num_classes*n_offsets] -> [N, n_offsets, num_classes] -> [N*k, num_classes]
-            segmentation_all = segmentation_anchor.view(anchor.shape[0], pc.n_offsets, pc.num_classes).view(-1, pc.num_classes)
-            seg_logits_all = segmentation_anchor_logit.view(anchor.shape[0], pc.n_offsets, pc.num_classes).view(-1, pc.num_classes)
-        else:
-            segmentation_all = segmentation_anchor.view(-1, 1)       # [N*k, 1]
-            seg_logits_all = segmentation_anchor_logit.view(-1, 1)   # [N*k, 1]
+        # [N, num_seg_ch*n_offsets] -> [N, n_offsets, num_seg_ch] -> [N*k, num_seg_ch]
+        segmentation_all = segmentation_anchor.view(anchor.shape[0], pc.n_offsets, num_seg_ch).view(-1, num_seg_ch)
+        seg_logits_all = segmentation_anchor_logit.view(anchor.shape[0], pc.n_offsets, num_seg_ch).view(-1, num_seg_ch)
     else:
-        segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)       # [N*k, C]
-        seg_logits_all = segmentation_anchor_logit.repeat_interleave(pc.n_offsets, dim=0)   # [N*k, C]
+        segmentation_all = segmentation_anchor.repeat_interleave(pc.n_offsets, dim=0)       # [N*k, num_seg_ch]
+        seg_logits_all = segmentation_anchor_logit.repeat_interleave(pc.n_offsets, dim=0)   # [N*k, num_seg_ch]
 
     # anchor index for each child Gaussian (before opacity masking)
     anchor_idx_all = torch.arange(anchor.shape[0], device=anchor.device).repeat_interleave(pc.n_offsets)  # [N*k]
@@ -131,19 +135,18 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
     concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets, segmentation_all], dim=-1)
     masked = concatenated_all[mask]
-    seg_ch = pc.num_classes if pc.num_classes > 1 else 1
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets, segmentation = masked.split([6, 3, 3, 7, 3, seg_ch], dim=-1)
-    
+    scaling_repeat, repeat_anchor, color, scale_rot, offsets, segmentation = masked.split([6, 3, 3, 7, 3, num_seg_ch], dim=-1)
+
     # post-process cov
-    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) 
+    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3])
     rot = pc.rotation_activation(scale_rot[:,3:7])
-    
+
     # post-process offsets
     offsets = offsets * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets
 
-    # mask seg logits and anchor indices for region consistency loss
-    seg_logits_masked = seg_logits_all[mask]      # [M, 1]
+    # mask seg logits/features and anchor indices for region consistency loss
+    seg_logits_masked = seg_logits_all[mask]      # [M, num_seg_ch]
     anchor_idx_masked = anchor_idx_all[mask]       # [M]
 
     return xyz, color, opacity, scaling, rot, neural_opacity, mask, segmentation, seg_logits_masked, anchor_idx_masked
@@ -200,7 +203,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = rot,
         cov3D_precomp = None)
 
-    # [修改点3] 语义掩码光栅化
+    # [修改点3] 语义特征光栅化
     # skip_mask=True 时跳过整个 mask pass（纯几何训练阶段加速）
     if skip_mask:
         return {"render": rendered_image,
@@ -232,20 +235,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     )
     rasterizer_mask = GaussianRasterizer(raster_settings=raster_settings_mask)
 
-    # [关键改进 v5] 使用 semantic_feature 通道直接渲染 mask，不再需要复制3通道的 hack。
-    # segmentation: [M, 1] (binary) or [M, num_classes] (multi-class)
-    # 多分类时：rasterizer 必须传入 probability（alpha-blend 对 logits 无意义，
-    # weighted average of logits != logit of weighted average）。
-    # 二分类时：保持传入 probability（与现有 BCE/focal loss 兼容）。
-    # CUDA rasterizer 要求 semantic_feature 的通道数必须严格等于 NUM_SEMANTIC_CHANNELS (128)，
-    # 因此需要将 [M, C] pad 到 [M, 128]，渲染后再切回前 C 个通道。
-    NUM_SEMANTIC_CHANNELS = 128
-    if pc.num_classes == 1:
-        seg_feature = segmentation  # [M, 1] probabilities
+    # [关键改进 v5] 使用 semantic_feature 通道直接渲染 mask/feature，不再需要复制3通道的 hack。
+    # CUDA rasterizer 要求 semantic_feature 的通道数必须严格等于 NUM_SEMANTIC_CHANNELS，
+    # 因此需要将 [M, C] pad 到 [M, NUM_SEMANTIC_CHANNELS]，渲染后再切回前 C 个通道。
+    # 在 Option A 中，NUM_SEMANTIC_CHANNELS 与 seg_feature_dim 相等（默认 8），因此无 padding。
+    NUM_SEMANTIC_CHANNELS = 8  # must match cuda_rasterizer/config.h
+    if pc.seg_feature_dim > 0:
+        seg_feature = segmentation  # [M, seg_feature_dim] raw features
+        orig_seg_ch = seg_feature.shape[1]
     else:
-        seg_feature = torch.softmax(seg_logits_masked, dim=-1)  # [M, C] probabilities
-    # 保存原始的通道数，用于后续切片（padding 后 shape 会变为 128）
-    orig_seg_ch = seg_feature.shape[1]
+        # Legacy mode: render class probabilities
+        if pc.num_classes == 1:
+            seg_feature = segmentation  # [M, 1] probabilities
+        else:
+            seg_feature = torch.softmax(seg_logits_masked, dim=-1)  # [M, C] probabilities
+        orig_seg_ch = seg_feature.shape[1]
     if seg_feature.shape[1] < NUM_SEMANTIC_CHANNELS:
         pad = torch.zeros(seg_feature.shape[0], NUM_SEMANTIC_CHANNELS - seg_feature.shape[1],
                           device=seg_feature.device, dtype=seg_feature.dtype)
@@ -273,16 +277,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         cov3D_precomp = None,
     )
     # rendered_mask_feature: [NUM_SEMANTIC_CHANNELS, H, W]
-    # For binary: take the first channel [1, H, W]
-    # For multi-class: take all C channels [C, H, W]
-    if orig_seg_ch == 1:
-        rendered_mask = rendered_mask_feature[0:1, :, :]
-    else:
-        rendered_mask = rendered_mask_feature[:orig_seg_ch, :, :]
+    # Slice back to original channel count
+    rendered_mask = rendered_mask_feature[:orig_seg_ch, :, :]
 
     # [修改点4] 始终返回包含 mask 的完整字典
     return {"render": rendered_image,
-            "mask": rendered_mask,  # [1, H, W] for binary or [C, H, W] for multi-class
+            "mask": rendered_mask,  # [seg_feature_dim, H, W] (Option A) or [C, H, W] (legacy)
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
@@ -292,7 +292,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "scaling": scaling,
             "segmentation": segmentation,
             "neural_xyz": xyz,                    # [M, 3]   child Gaussian world coords
-            "neural_seg_logits": seg_logits_masked,  # [M, 1]   pre-sigmoid seg logits
+            "neural_seg_features": seg_logits_masked,  # [M, seg_feature_dim] raw features (Option A) or [M, C] logits (legacy)
+            "neural_seg_logits": seg_logits_masked,    # backward-compat alias
             "neural_anchor_idx": anchor_idx_masked,   # [M]      anchor index per child
             }
 

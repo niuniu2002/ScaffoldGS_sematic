@@ -93,6 +93,13 @@ class ModelParams(ParamGroup):
         self.num_classes = 1  # 1=binary(sigmoid), >=2=multi-class(softmax)
         self.no_opacity_detach = False  # True=mask loss can flow to opacity MLP (ablation)
         self.dual_feature = False       # True=seg branch uses independent _anchor_feat_seg instead of feat.detach()
+
+        # --- Option A: low-dimensional rendered semantic features + 2D decoder ---
+        # 0 = legacy mode (SegmentationHead outputs probabilities, pad to NUM_SEMANTIC_CHANNELS)
+        # >0 = render low-dim features then decode to logits with a lightweight 2D head
+        self.seg_feature_dim = 8
+        self.seg_decoder_hidden = 64
+        self.seg_decoder_layers = 2
         self.mask_mode = "auto"  # "auto" | "binary" | "multiclass". How to interpret mask values.
                                  # auto: detect 0/255 -> binary; binary: force 0/255 -> 0/1; multiclass: keep as-is
 
@@ -184,6 +191,8 @@ class OptimizationParams(ParamGroup):
         # Linearly ramp mask_weight from 0 -> mask_weight
         self.mask_warmup = 0          # iterations to keep mask weight at 0
         self.mask_ramp = 0            # iterations to linearly ramp to full weight
+        # Compute mask loss every N iterations; 1 = every iteration (default)
+        self.mask_every = 1
 
         # KNN consistency (smooth segmentation logits on anchors)
         self.knn_weight = 0.05
@@ -194,6 +203,12 @@ class OptimizationParams(ParamGroup):
         # Linearly ramp knn_weight from 0 -> knn_weight
         self.knn_warmup = 0
         self.knn_ramp = 0
+        # Adaptive KNN: reduce sampling and frequency in late stage to speed up training
+        self.knn_adaptive = False
+        self.knn_late_stage_iter = 10_000
+        self.knn_late_stage_factor = 5
+        self.knn_min_samples = 256
+        self.knn_max_samples = 1024
 
         # --- Focal loss / uncertainty-aware weighting (optional) ---
         # Focal loss alpha (class imbalance)
@@ -228,6 +243,9 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+        # DroneSplat-style dynamic densify threshold scheduling
+        self.schedule_densify_grad_threshold = False
+        self.densify_grad_threshold_final = 0.001
 
         # --- Foreground-only Anchor Voting Loss ---
         self.anchor_fg_weight = 0.0

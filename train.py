@@ -56,6 +56,23 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
 
+def decode_rendered_mask(pc, rendered_features):
+    """Convert rendered low-dim semantic features to class probabilities.
+
+    In Option A (seg_feature_dim > 0), rendered_features are raw [seg_feature_dim, H, W]
+    features and are passed through the 2D semantic_decoder. In legacy mode
+    (seg_feature_dim == 0), rendered_features are already probabilities.
+    """
+    if rendered_features is None:
+        return None
+    if getattr(pc, 'seg_feature_dim', 0) > 0 and getattr(pc, 'semantic_decoder', None) is not None:
+        logits = pc.semantic_decoder(rendered_features.unsqueeze(0)).squeeze(0)
+        if pc.num_classes == 1:
+            return torch.sigmoid(logits)
+        return torch.softmax(logits, dim=0)
+    return rendered_features
+
+
 def dice_loss(pred: torch.Tensor,
               target: torch.Tensor,
               smooth: float = 1.0) -> torch.Tensor:
@@ -510,13 +527,70 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                               use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False),
                               num_classes=getattr(dataset, 'num_classes', 1),
                               no_opacity_detach=getattr(dataset, 'no_opacity_detach', False),
-                              dual_feature=getattr(dataset, 'dual_feature', False))
+                              dual_feature=getattr(dataset, 'dual_feature', False),
+                              seg_feature_dim=getattr(dataset, 'seg_feature_dim', 0),
+                              seg_decoder_hidden=getattr(dataset, 'seg_decoder_hidden', 64),
+                              seg_decoder_layers=getattr(dataset, 'seg_decoder_layers', 2))
     # 如果提供了 load_iteration，则从对应的 point_cloud/iteration_X 加载已有高斯作为初始化
     scene = Scene(dataset, gaussians, load_iteration=load_iteration, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # Lightweight per-iteration profiler (enabled via SCAFFOLD_PROFILE=1)
+    PROFILE_TRAIN = os.environ.get('SCAFFOLD_PROFILE', '0') == '1'
+    class IterTimer:
+        def __init__(self, enabled, window=100):
+            self.enabled = enabled
+            self.window = window
+            self.records = {}
+            self.counts = {}
+            self.active = None
+            self.active_start = None
+            self.iter_count = 0
+        def start(self, name):
+            if not self.enabled:
+                return
+            torch.cuda.synchronize()
+            if self.active is not None:
+                dur = time.perf_counter() - self.active_start
+                self.records[self.active] = self.records.get(self.active, 0.0) + dur
+                self.counts[self.active] = self.counts.get(self.active, 0) + 1
+            self.active = name
+            self.active_start = time.perf_counter()
+        def end(self, name=None):
+            if not self.enabled:
+                return
+            torch.cuda.synchronize()
+            if self.active is None:
+                return
+            dur = time.perf_counter() - self.active_start
+            self.records[self.active] = self.records.get(self.active, 0.0) + dur
+            self.counts[self.active] = self.counts.get(self.active, 0) + 1
+            self.active = None
+        def report(self, iteration):
+            if not self.enabled:
+                return
+            self.iter_count += 1
+            if self.iter_count <= self.window:
+                return
+            if iteration % self.window != 1:
+                return
+            total = sum(self.records.values())
+            if total == 0:
+                return
+            print(f"\n[PROFILE iter {iteration-1}] avg per-iter breakdown over last {self.window} iters:")
+            order = ['render', 'rgb_loss', 'mask_loss', 'knn_loss', 'aux_loss', 'backward', 'densify', 'optimizer', 'logging', 'other']
+            for k in order:
+                if k in self.records:
+                    ms = self.records[k] / max(1, self.counts[k]) * 1000
+                    pct = self.records[k] / total * 100
+                    print(f"  {k:12s}: {ms:7.2f} ms ({pct:5.1f}%)")
+            # reset
+            self.records.clear()
+            self.counts.clear()
+    iter_timer = IterTimer(PROFILE_TRAIN, window=100)
 
     # [Two-Stage] 如果只训练 segmentation，冻结所有参数并替换 optimizer
     if getattr(opt, 'seg_only', False):
@@ -527,15 +601,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             logger.info("\n[Two-Stage Mode] Replacing seg head with deep MLP and freezing all other parameters.")
             # 重新初始化更深的分割头（替换从 checkpoint 加载的浅 MLP）
             if gaussians.use_per_gaussian_seg:
-                seg_outputs = gaussians.num_classes * gaussians.n_offsets
+                seg_outputs = gaussians.seg_feature_dim * gaussians.n_offsets if gaussians.seg_feature_dim > 0 else gaussians.num_classes * gaussians.n_offsets
             else:
-                seg_outputs = gaussians.num_classes
+                seg_outputs = gaussians.seg_feature_dim if gaussians.seg_feature_dim > 0 else gaussians.num_classes
+            output_activation = 'none' if gaussians.seg_feature_dim > 0 else 'sigmoid'
             gaussians.mlp_segmentation = SegmentationHead(
                 feat_dim=gaussians.feat_dim,
                 hidden_dim=128,
                 num_layers=3,
                 dropout=0.0,
                 num_outputs=seg_outputs,
+                output_activation=output_activation,
             ).cuda()
         # Freeze all explicit parameters
         for attr in ('_anchor', '_offset', '_anchor_feat', '_anchor_feat_seg', '_scaling', '_rotation', '_opacity'):
@@ -552,16 +628,21 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         if gaussians.appearance_dim > 0 and gaussians.embedding_appearance is not None:
             for p in gaussians.embedding_appearance.parameters():
                 p.requires_grad = False
-        # New seg head remains trainable (default requires_grad=True)
+        # New seg head (and decoder if Option A) remains trainable
         for param in gaussians.mlp_segmentation.parameters():
             param.requires_grad = True
+        params_to_optimize = list(gaussians.mlp_segmentation.parameters())
+        if gaussians.seg_feature_dim > 0 and gaussians.semantic_decoder is not None:
+            for param in gaussians.semantic_decoder.parameters():
+                param.requires_grad = True
+            params_to_optimize += list(gaussians.semantic_decoder.parameters())
         # 替换为只包含 segmentation 的 optimizer
         gaussians.optimizer = torch.optim.Adam(
-            gaussians.mlp_segmentation.parameters(),
+            params_to_optimize,
             lr=0.001,
             eps=1e-15
         )
-        logger.info(f"  Optimizable params: {sum(p.numel() for p in gaussians.mlp_segmentation.parameters())}")
+        logger.info(f"  Optimizable params: {sum(p.numel() for p in params_to_optimize)}")
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -615,14 +696,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        
+
+        iter_timer.start('render')
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
+
+        # Hard semantic warmup: before start_semantic_iter, skip mask/knn losses entirely.
+        start_semantic_iter = int(getattr(opt, "start_semantic_iter", 7000))
+        semantic_enabled = (iteration >= start_semantic_iter)
+        semantic_phase_iter = iteration - start_semantic_iter  # 0 at first semantic iteration
+
+        # Skip expensive mask pass on iterations where mask loss is not computed
+        mask_every = int(getattr(opt, "mask_every", 1))
+        skip_mask = not (semantic_enabled and mask_every > 0 and (semantic_phase_iter % mask_every == 0))
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad,
-                            iteration=iteration, opacity_grad_until=int(getattr(opt, 'opacity_grad_until', -1)))
-        
+                            iteration=iteration, opacity_grad_until=int(getattr(opt, 'opacity_grad_until', -1)), skip_mask=skip_mask)
+
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
+        iter_timer.start('rgb_loss')
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
 
@@ -646,14 +739,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         # =========================================================================================
 
         # 1. Mask Loss (权重可配置 + 硬性语义预热 + 可升温)
-        pred_mask = render_pkg.get("mask", None)
+        pred_features = render_pkg.get("mask", None)
+        pred_mask = decode_rendered_mask(gaussians, pred_features)
         gt_mask = viewpoint_cam.semantic_mask.cuda() if getattr(viewpoint_cam, "semantic_mask", None) is not None else None
 
-        # Hard semantic warmup: before start_semantic_iter, skip mask/knn losses entirely.
-        start_semantic_iter = int(getattr(opt, "start_semantic_iter", 7000))
-        semantic_enabled = (iteration >= start_semantic_iter)
-        semantic_phase_iter = iteration - start_semantic_iter  # 0 at first semantic iteration
-        
+        iter_timer.start('mask_loss')
         if semantic_enabled and pred_mask is not None and gt_mask is not None:
             num_classes = gaussians.num_classes
             dice_weight = float(getattr(opt, "dice_weight", 1.0))
@@ -813,33 +903,52 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     op_status = "grad" if (op_until > 0 and iteration < op_until) or (getattr(gaussians, 'no_opacity_detach', False) and op_until <= 0) else "detach"
                     print(f"Iter {iteration}: Mask Loss = {loss_seg.item():.5f} (nll={loss_nll.item():.5f}, dice={loss_dice.item():.5f}, focal={loss_focal.item():.5f}, w={seg_w:.4f}) [opacity={op_status}]")
 
+        iter_timer.start('knn_loss')
         # 2. KNN Consistency Loss (权重可配置 + 硬性语义预热 + 可升温 + 可调频率)
         knn_every = int(getattr(opt, "knn_every", 0))
         knn_offset = int(getattr(opt, "knn_offset", 0))
-        do_knn = (knn_every > 0) and ((iteration - knn_offset) % knn_every == 0)
+        # Adaptive KNN frequency: reduce frequency in late stage to save time
+        effective_knn_every = knn_every
+        if knn_every > 0 and getattr(opt, 'knn_adaptive', False) and iteration >= int(getattr(opt, 'knn_late_stage_iter', 10000)):
+            effective_knn_every = knn_every * int(getattr(opt, 'knn_late_stage_factor', 5))
+        do_knn = (knn_every > 0) and ((iteration - knn_offset) % effective_knn_every == 0)
         if semantic_enabled and gt_mask is not None and do_knn:
             try:
                 # 获取锚点数据 (保持在 CUDA)
                 anchor_xyz = gaussians.get_anchor.detach()
-                # [改进] 使用 logit-space 的 segmentation 值，避免概率空间 MSE 推向 0.5
-                anchor_seg_logit = gaussians.get_anchor_seg_logits_raw()
+                # Option A: 当 seg_feature_dim > 0 时，在特征空间做 MSE KNN consistency
+                use_feature_knn = getattr(gaussians, 'seg_feature_dim', 0) > 0
+                if use_feature_knn:
+                    anchor_seg_feat = gaussians.get_anchor_seg_features()
+                else:
+                    # [改进] 使用 logit-space 的 segmentation 值，避免概率空间 MSE 推向 0.5
+                    anchor_seg_logit = gaussians.get_anchor_seg_logits_raw()
 
                 # 长度一致性检查 (防止剪枝后显存未同步)
-                if anchor_xyz.shape[0] != anchor_seg_logit.shape[0]:
+                check_tensor = anchor_seg_feat if use_feature_knn else anchor_seg_logit
+                if anchor_xyz.shape[0] != check_tensor.shape[0]:
                     pass
                 else:
                     N = anchor_xyz.shape[0]
                     if N > 1:
-                        # 更保守的采样上限，减少内存压力
-                        n_samples = min(1024, N)
+                        # Adaptive sampling: smaller sample for very large anchor counts
+                        if getattr(opt, 'knn_adaptive', False):
+                            knn_min = int(getattr(opt, 'knn_min_samples', 256))
+                            knn_max = int(getattr(opt, 'knn_max_samples', 1024))
+                            n_samples = min(max(knn_min, N // 100), knn_max)
+                        else:
+                            n_samples = min(1024, N)
                         indices = torch.randperm(N, device=anchor_xyz.device)[:n_samples]
 
                         # anchor_xyz 作为位置只需副本，不影响梯度路径
                         anchor_xyz_safe = anchor_xyz.detach().clone().contiguous()
                         sample_xyz = anchor_xyz_safe[indices].contiguous()
 
-                        # anchor_seg_logit 保留梯度，用于更新 mlp_segmentation
-                        sample_logit = anchor_seg_logit[indices].contiguous()
+                        if use_feature_knn:
+                            sample_feat = anchor_seg_feat[indices].contiguous()
+                        else:
+                            # anchor_seg_logit 保留梯度，用于更新 mlp_segmentation
+                            sample_logit = anchor_seg_logit[indices].contiguous()
 
                         # 分块计算距离以降低峰值显存占用
                         chunk_size = 512
@@ -864,32 +973,42 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
                             if k > 1:
                                 neighbor_inds = topk_inds[:, 1:]
-                                neighbor_logit = anchor_seg_logit[neighbor_inds]
 
-                                num_classes_knn = gaussians.num_classes
-                                if num_classes_knn == 1:
-                                    # [改进 v2] 概率空间对称 BCE KNN（二分类）
-                                    sample_prob = torch.sigmoid(sample_logit).unsqueeze(1)      # [n_samples, 1]
-                                    neighbor_prob = torch.sigmoid(neighbor_logit)               # [n_samples, k-1]
-                                    eps = 1e-6
-                                    loss_knn = -0.5 * (
-                                        sample_prob * torch.log(neighbor_prob + eps)
-                                        + (1.0 - sample_prob) * torch.log(1.0 - neighbor_prob + eps)
-                                        + neighbor_prob * torch.log(sample_prob + eps)
-                                        + (1.0 - neighbor_prob) * torch.log(1.0 - sample_prob + eps)
+                                if use_feature_knn:
+                                    neighbor_feat = anchor_seg_feat[neighbor_inds]
+                                    # feature-space MSE; symmetric by construction
+                                    loss_knn = F.mse_loss(
+                                        sample_feat.unsqueeze(1).expand_as(neighbor_feat),
+                                        neighbor_feat
                                     )
-                                    loss_knn = loss_knn.mean()
-                                    knn_loss_name = "KNN(BCE)"
+                                    knn_loss_name = "KNN(FeatMSE)"
                                 else:
-                                    # 多分类 KNN：symmetric KL divergence (stronger than MSE)
-                                    sample_prob = torch.nn.functional.softmax(sample_logit, dim=-1).unsqueeze(1)   # [n_samples, 1, C]
-                                    neighbor_prob = torch.nn.functional.softmax(neighbor_logit, dim=-1)              # [n_samples, k-1, C]
-                                    eps = 1e-7
-                                    # KL(P||Q) + KL(Q||P)
-                                    kl_sn = (sample_prob * (torch.log(sample_prob + eps) - torch.log(neighbor_prob + eps))).sum(dim=-1)
-                                    kl_ns = (neighbor_prob * (torch.log(neighbor_prob + eps) - torch.log(sample_prob + eps))).sum(dim=-1)
-                                    loss_knn = 0.5 * (kl_sn + kl_ns).mean()
-                                    knn_loss_name = "KNN(KL)"
+                                    neighbor_logit = anchor_seg_logit[neighbor_inds]
+
+                                    num_classes_knn = gaussians.num_classes
+                                    if num_classes_knn == 1:
+                                        # [改进 v2] 概率空间对称 BCE KNN（二分类）
+                                        sample_prob = torch.sigmoid(sample_logit).unsqueeze(1)      # [n_samples, 1]
+                                        neighbor_prob = torch.sigmoid(neighbor_logit)               # [n_samples, k-1]
+                                        eps = 1e-6
+                                        loss_knn = -0.5 * (
+                                            sample_prob * torch.log(neighbor_prob + eps)
+                                            + (1.0 - sample_prob) * torch.log(1.0 - neighbor_prob + eps)
+                                            + neighbor_prob * torch.log(sample_prob + eps)
+                                            + (1.0 - neighbor_prob) * torch.log(1.0 - sample_prob + eps)
+                                        )
+                                        loss_knn = loss_knn.mean()
+                                        knn_loss_name = "KNN(BCE)"
+                                    else:
+                                        # 多分类 KNN：symmetric KL divergence (stronger than MSE)
+                                        sample_prob = torch.nn.functional.softmax(sample_logit, dim=-1).unsqueeze(1)   # [n_samples, 1, C]
+                                        neighbor_prob = torch.nn.functional.softmax(neighbor_logit, dim=-1)              # [n_samples, k-1, C]
+                                        eps = 1e-7
+                                        # KL(P||Q) + KL(Q||P)
+                                        kl_sn = (sample_prob * (torch.log(sample_prob + eps) - torch.log(neighbor_prob + eps))).sum(dim=-1)
+                                        kl_ns = (neighbor_prob * (torch.log(neighbor_prob + eps) - torch.log(sample_prob + eps))).sum(dim=-1)
+                                        loss_knn = 0.5 * (kl_sn + kl_ns).mean()
+                                        knn_loss_name = "KNN(KL)"
 
                                 knn_w = float(getattr(opt, "knn_weight", 0.0)) * _ramp_factor(
                                     semantic_phase_iter,
@@ -899,7 +1018,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 if knn_w > 0:
                                     loss = loss + knn_w * loss_knn
 
-                                print(f"Iter {iteration}: {knn_loss_name} Loss = {loss_knn.item():.6f} (w={knn_w:.4f}, every={knn_every}, offset={knn_offset})")
+                                print(f"Iter {iteration}: {knn_loss_name} Loss = {loss_knn.item():.6f} (w={knn_w:.4f}, every={effective_knn_every}, offset={knn_offset}, samples={n_samples})")
 
                             # 及时清理中间变量并释放显存
                             del dists, topk_inds, topk_val, dists_chunks
@@ -923,7 +1042,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
-        
+
+        iter_timer.start('aux_loss')
         # =========================================================================================
 
         # 3. Foreground-only Anchor Voting Loss
@@ -1060,8 +1180,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 except Exception:
                     pass
 
+        iter_timer.start('backward')
         loss.backward()
-        
+
         iter_end.record()
 
         with torch.no_grad():
@@ -1069,11 +1190,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}",
+                    "Anchors": f"{scene.gaussians.get_anchor.shape[0]}",
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            iter_timer.start('logging')
             # Log and save
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, auto_twostage=getattr(opt, 'auto_twostage', False), model_path=dataset.model_path)
 
@@ -1103,7 +1228,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-            
+
+            iter_timer.start('densify')
             # densification
             if not getattr(opt, 'seg_only', False) and iteration < opt.update_until and iteration > opt.start_stat:
                 # add statis
@@ -1111,13 +1237,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
+                    grad_threshold = opt.densify_grad_threshold
+                    if getattr(opt, 'schedule_densify_grad_threshold', False):
+                        progress = min(iteration / opt.update_until, 1.0)
+                        grad_threshold = opt.densify_grad_threshold + (opt.densify_grad_threshold_final - opt.densify_grad_threshold) * progress
+                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=grad_threshold, min_opacity=opt.min_opacity)
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
                 torch.cuda.empty_cache()
-                    
+
+            iter_timer.start('optimizer')
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
@@ -1125,6 +1256,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+            iter_timer.start('other')
+            iter_timer.report(iteration)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -1199,7 +1333,8 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     ssim_test += ssim(image, gt_image).mean().double()
 
                     # 2. 计算语义精度 (mIoU)
-                    pred_mask = render_pkg.get("mask", None)
+                    pred_features = render_pkg.get("mask", None)
+                    pred_mask = decode_rendered_mask(scene.gaussians, pred_features)
                     gt_mask = getattr(viewpoint, "semantic_mask", None)
                     if pred_mask is not None and gt_mask is not None:
                         gt_mask = gt_mask.cuda()
@@ -1482,7 +1617,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                               use_per_gaussian_seg=getattr(dataset, 'use_per_gaussian_seg', False),
                               num_classes=getattr(dataset, 'num_classes', 1),
                               no_opacity_detach=getattr(dataset, 'no_opacity_detach', False),
-                              dual_feature=getattr(dataset, 'dual_feature', False))
+                              dual_feature=getattr(dataset, 'dual_feature', False),
+                              seg_feature_dim=getattr(dataset, 'seg_feature_dim', 0),
+                              seg_decoder_hidden=getattr(dataset, 'seg_decoder_hidden', 64),
+                              seg_decoder_layers=getattr(dataset, 'seg_decoder_layers', 2))
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 

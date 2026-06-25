@@ -1,6 +1,8 @@
 """
-Evaluate trained model on myvideo dataset (human-annotated masks).
-Computes per-image IoU and mean IoU across all views.
+Scene Multiclass Segmentation Evaluation Script
+
+Evaluates multiclass semantic segmentation on any scene.
+Supports configurable resolution to avoid OOM on large images.
 """
 import os
 import sys
@@ -18,7 +20,8 @@ from arguments import ModelParams, PipelineParams
 from train import decode_rendered_mask
 
 
-def evaluate_on_myvideo(model_path, source_path, iteration, white_background=False, appearance_dim=32, use_per_gaussian_seg=False, num_classes=1, resolution=-1, seg_feature_dim=0, seg_decoder_hidden=64, seg_decoder_layers=2, dual_feature=False):
+def evaluate_on_myvideo(model_path, source_path, iteration, white_background=False, appearance_dim=32, use_per_gaussian_seg=False, num_classes=1, resolution=-1,
+                        seg_feature_dim=0, seg_decoder_hidden=64, seg_decoder_layers=2, dual_feature=False):
     parser = argparse.ArgumentParser()
     ModelParams(parser)
     arg_list = [
@@ -50,28 +53,6 @@ def evaluate_on_myvideo(model_path, source_path, iteration, white_background=Fal
 
     # Load scene (this also loads MLP checkpoints automatically)
     scene = Scene(args, gaussians, load_iteration=iteration, shuffle=False)
-
-    # Replace masks with human-annotated masks if available
-    human_masks_dir = os.path.join(source_path, "masks_human")
-    if os.path.exists(human_masks_dir):
-        print(f"[INFO] Replacing masks with human annotations from {human_masks_dir}")
-        for cam in scene.getTrainCameras() + scene.getTestCameras():
-            human_mask_path = os.path.join(human_masks_dir, cam.image_name + ".png")
-            if os.path.exists(human_mask_path):
-                mask_pil = Image.open(human_mask_path)
-                if mask_pil.size != (cam.width, cam.height):
-                    mask_pil = mask_pil.resize((cam.width, cam.height), Image.NEAREST)
-                mask_np = np.array(mask_pil)
-                # 兼容 0/255 -> 0/1
-                if np.array_equal(np.unique(mask_np), [0, 255]):
-                    mask_np = mask_np // 255
-                mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).long()
-                cam._semantic_mask = mask_tensor
-                cam._semantic_mask_path = human_mask_path
-            else:
-                print(f"[WARNING] No human mask found for {cam.image_name}, keeping original mask")
-    else:
-        print(f"[INFO] No masks_human/ directory found at {human_masks_dir}, using default masks")
 
     # Background
     bg_color = [1, 1, 1] if white_background else [0, 0, 0]

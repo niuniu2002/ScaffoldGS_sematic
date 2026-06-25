@@ -18,7 +18,8 @@ from arguments import ModelParams, PipelineParams
 from train import decode_rendered_mask
 
 
-def evaluate_on_myvideo(model_path, source_path, iteration, white_background=False, appearance_dim=32, use_per_gaussian_seg=False, num_classes=1, resolution=-1, seg_feature_dim=0, seg_decoder_hidden=64, seg_decoder_layers=2, dual_feature=False):
+def evaluate_on_myvideo(model_path, source_path, iteration, white_background=False, appearance_dim=32, use_per_gaussian_seg=False, num_classes=1, resolution=-1,
+                        seg_feature_dim=0, seg_decoder_hidden=64, seg_decoder_layers=2, dual_feature=False):
     parser = argparse.ArgumentParser()
     ModelParams(parser)
     arg_list = [
@@ -84,9 +85,12 @@ def evaluate_on_myvideo(model_path, source_path, iteration, white_background=Fal
             self.convert_SHs_python = False
     pipe = FakePipe()
 
-    # Collect all cameras (train + test)
-    all_cameras = scene.getTrainCameras() + scene.getTestCameras()
-    print(f"Total cameras to evaluate: {len(all_cameras)}")
+    # Collect only cameras that have human-annotated masks
+    all_cameras = []
+    for cam in scene.getTrainCameras() + scene.getTestCameras():
+        if cam._semantic_mask_path is not None and "masks_human" in cam._semantic_mask_path:
+            all_cameras.append(cam)
+    print(f"Total cameras to evaluate (human annotated only): {len(all_cameras)}")
 
     ious = []
     psnrs = []

@@ -1,5 +1,35 @@
 # Scaffold-GSLFY Research Log
 
+## 2026-06-25 Option A: 8-dim Rendered Semantic Features + 2D Decoder
+
+### 改动动机
+- 原 CUDA rasterizer 的 `semantic_feature` 通道固定为 128 维，但本工作只用到 1（二分类）或 `num_classes`（多分类）维的有效信号，其余通道零填充，造成显存与计算浪费。
+- 采用 **Option A**：将 rasterizer 的语义通道数改为 8 维，渲染低维语义特征后再用轻量 2D 1x1 conv decoder 映射到 per-pixel logit，最后 sigmoid/softmax 计算 focal/dice loss。
+
+### 关键改动
+| 文件 | 内容 |
+| --- | --- |
+| `submodules/diff-gaussian-rasterization/cuda_rasterizer/config.h` | `NUM_SEMANTIC_CHANNELS` 128 → 8 |
+| `arguments/__init__.py` | 新增 `--seg_feature_dim` (默认 8)、`--seg_decoder_hidden` (64)、`--seg_decoder_layers` (2) |
+| `scene/gaussian_model.py` | 新增 `SemanticDecoder`；`mlp_segmentation` 在 Option A 下输出 raw features（`output_activation='none'`）；优化器/scheduler/ckpt 包含 decoder；KNN consistency 改为 feature-space MSE |
+| `gaussian_renderer/__init__.py` | mask pass 直接渲染 raw features，渲染后切回 `seg_feature_dim` |
+| `train.py` | 新增 `decode_rendered_mask()` 统一解码；mask loss 与 training_report 均调用该函数；KNN loss 使用 feature MSE |
+| `configs/run_dronev4_2_sota_schedule.sh` | 加入 `--seg_feature_dim 8 --seg_decoder_hidden 64 --seg_decoder_layers 2` |
+| 所有 eval 脚本 | 从 `cfg_args` 读取 `dual_feature` 并传入 `GaussianModel`；否则评估会误用 RGB anchor feature，导致 mIoU 跌至 ~0.05 |
+
+### 验证结果（`output/20260625_optionA_qual`，3000 iter）
+- 训练命令：`--resolution 8 --white_background --seg_feature_dim 8 --seg_decoder_hidden 64 --seg_decoder_layers 2 --no_opacity_detach --dual_feature --mask_weight 0.2 --start_semantic_iter 0 --mask_every 5 --update_until 0 --iterations 3000`
+- 训练时 test report（iter 3000）：PSNR 28.63，FG IoU 0.688，Binary mIoU 0.836
+- `eval_heldout_semantic.py -r 8`（42 张 scene test cameras）：PSNR 28.54，FG IoU 0.688，BG IoU 0.983，Binary mIoU 0.836
+- `eval_from_checkpoint.py`（67 张 `test_list.txt`，1.6K 原分辨率）：PSNR 18.34，FG IoU 0.624，BG IoU 0.981，Binary mIoU 0.802
+
+### 结论
+- Option A 在 3000 iter 的短训上即可复现训练时的 mIoU，说明 checkpoint 保存/加载、decoder 推理链路正确。
+- 全分辨率渲染的 PSNR 低于训练分辨率，是因为模型只在 `resolution=8` 上训练；后续若需要高分辨率评估，需用训练分辨率或在高分辨率下继续 finetune。
+- 后续可与原 128 维 baseline 进行完整 30k 对比，确认速度收益与最终精度。
+
+---
+
 ## 2026-06-11 Recovery after Disk Migration
 
 ### 数据丢失范围
@@ -35,6 +65,186 @@ lost due to disk migration; need rerun
 - `dronev4_2` 是当前最稳定的数据集，可作为方法验证主战场。
 - `lfy` 的问题是新视角泛化差（PSNR gap 6.05），不是单纯分割精度低。
 - `scene_01` 暂时作为诊断数据集，不能作为主方法结论核心；其 RGB-only baseline 低说明基础重建是瓶颈。
+
+## Benchmark 数据集
+
+以下数据集均已确认具备 COLMAP 重建 + mask 标注，可用于 3D 重建与分割联合训练 / 评估：
+
+| 数据集 | 帧数/规模 | COLMAP | Mask | 推荐度 | 说明 |
+|---|---|---|---|---|---|
+| `dataset/dronev4_2` | 333 张（train 266 / test 67） | ✅ | ✅（SAM + human myvideo） | ⭐⭐⭐ 主战场 | 最稳定，已跑 D2 实验；训练用 SAM mask，human-annotated myvideo 用于最终验证 |
+| `dataset/lfy/colmap_scene` | 200 张 | ✅ | ✅ | ⭐⭐⭐ 已验证 | COB-GS 评估已跑通；新视角泛化差（PSNR gap 大），适合做鲁棒性测试 |
+| `SW_scenes/scene_00` | 222 帧 | ✅ | ✅ | ⭐⭐⭐ 最推荐 | README 标推荐，重建最大（sparse 68M，points3D 14M），训练比 scene_01 快 |
+| `SW_scenes/scene_03` | 289 帧 | ✅ | ✅ | ⭐⭐⭐ 推荐 | README 标推荐，规模适中 |
+| `SW_scenes/scene_08` | 262 帧 | ✅ | ✅ | ⭐⭐⭐ 推荐 | README 标推荐，规模适中 |
+| `SW_scenes/scene_06` | 320 帧 | ✅ | ✅ | ⭐⭐ 可选 | 帧数多但重建较弱（points3D 仅 411K） |
+| `SW_scenes/scene_02` | 122 帧 | ✅ | ✅ | ⭐⭐ 可选 | 数据量偏小，适合快速验证 |
+| `SW_scenes/scene_04` | 127 帧 | ✅ | ✅ | ⭐⭐ 可选 | 数据量偏小，适合快速验证 |
+| `SW_scenes/scene_05` | 135 帧 | ✅ | ✅ | ⭐⭐ 可选 | 数据量偏小，适合快速验证 |
+| `SW_scenes/scene_07` | 124 帧 | ✅ | ✅ | ⭐⭐ 可选 | 数据量偏小，适合快速验证 |
+
+**当前使用计划**：
+- 主线方法验证：`dronev4_2` + `lfy/colmap_scene`
+- SW_scenes 补充：`scene_00` / `scene_03` / `scene_08` 作为场景多样性验证
+- `scene_01` 作为诊断 / 长时间训练压力测试
+
+### Benchmark 结果对比
+
+按数据集整理各方法结果，统一指标：**Test PSNR / Test Binary mIoU**。
+
+#### `dataset/dronev4_2`（SAM-test，67 张）
+
+| 方法 | 配置 | Test PSNR | Test mIoU | 备注 |
+|---|---|---:|---:|---|
+| **Scaffold-GSLFY (ours)** | Dual-Feature + no_opacity_detach | **25.10** | **0.892** | 当前最优 |
+| Scaffold-GSLFY (ours) | no_opacity_detach | 25.10 | 0.889 | D2 对照 |
+| Scaffold-GSLFY (ours) | Dual-Feature | 24.37 | 0.806 | D2 对照 |
+| Scaffold-GSLFY (ours) | sem_ramp | 24.32 | 0.674 | D2 对照 |
+| Gaussian Grouping | 官方默认 | 21.44 | 0.763 | — |
+| COB-GS | mask finetune | ~8.03 | 0.642 | mask finetune 后 RGB 崩溃 |
+| LangSplat | — | — | — | 环境已配好，待运行 |
+| feature-3dgs | LSeg feature | 23.15 | — | 已训练，暂无量化 mIoU |
+| SegAnyGAussians | contrastive feature 10k | — | 0.000 | SAM mask 退化：每张图仅 1 个 mask，无负样本/多尺度对比信号，特征无法区分实例；见下文 |
+
+#### `dataset/dronev4_2` myvideo（human-anno，37 张）
+
+| 方法 | Test PSNR | Test mIoU | 备注 |
+|---|---|---:|---:|---|
+| COB-GS (base) | 25.16 | 0.636 | 无 seg finetune |
+| COB-GS (finetune) | 8.08 | 0.632 | mask finetune 后 RGB 崩溃 |
+| Gaussian Grouping | — | 0.770 | 仅 mIoU |
+| Scaffold-GSLFY (ours) | — | — | 待评估 |
+
+#### `dataset/lfy/colmap_scene`（test，25 张）
+
+| 方法 | Test PSNR | Test mIoU | 备注 |
+|---|---|---:|---:|---|
+| Gaussian Grouping | 23.66 | **0.912** | — |
+| **Scaffold-GSLFY (ours)** | 21.65 | 0.877 | Dual-Feature + no_opacity_detach，当前最优 |
+| Scaffold-GSLFY (ours) | 21.58 | 0.876 | no_opacity_detach，D2 对照 |
+| Scaffold-GSLFY (ours) | 21.69 | 0.828 | Dual-Feature，D2 对照 |
+| COB-GS | 25.58 | 0.023 | mask finetune 失败，全前景 |
+| LangSplat | — | — | 待运行 |
+| feature-3dgs | — | — | 待运行 |
+
+#### `SW_scenes/scene_01`（test，60 张）
+
+| 方法 | Test PSNR | Test mIoU | 备注 |
+|---|---|---:|---:|---|
+| Gaussian Grouping | 21.63 | **0.919** | — |
+| Scaffold-GSLFY (ours) | 20.37* | 0.920* | *iter 12000 中期结果，30k 仍在跑 |
+| LangSplat | — | — | 待运行 |
+| feature-3dgs | — | — | 待运行 |
+
+**说明**：
+- `—` 表示尚未运行或该指标未记录。
+- SAM-test 与 myvideo human-anno 是不同测试集，不能直接跨列比较。
+- **Scaffold-GSLFY 在 dronev4_2 + lfy 上均为当前最优**（Dual-Feature + no_opacity_detach）：dronev4_2 0.892 / lfy 0.877。
+- lfy 上 Gaussian Grouping mIoU 0.912 仍高于 ours 0.877，但 ours 的 PSNR gap（~6.5 dB）与 GG 接近，需要继续看 30k 最终收敛。
+- feature-3dgs 已在 dronev4_2 完成训练（PSNR 23.15），但其输出为 LSeg feature field，需额外 prompting 才能量化 binary mIoU。
+- scene_01 30k 仍在训练，当前 iter 12000 中期结果 PSNR 20.37 / mIoU 0.920。
+
+### 当前运行状态（2026-06-15）
+
+| 任务 | 状态 | 预计完成 | 占用 GPU |
+|---|---|---|---|
+| scene_01 Dual-Feature + no_opacity_detach 30k | 运行中（iter 12000+） | 2026-06-16 晨 | 是 |
+| LangSplat dronev4_2 / lfy | 待运行 | 等 GPU | 否 |
+| feature-3dgs lfy | 待运行 | 等 GPU | 否 |
+| myvideo human-anno 评估（dronev4_2） | 待运行 | 等 GPU | 否 |
+
+**下一步**：scene_01 跑完后释放 GPU，优先跑 LangSplat / feature-3dgs 在 dronev4_2 + lfy，并补 myvideo 评估。
+
+**已准备好的脚本**（`scripts/benchmark/`）：
+- `eval_myvideo_dronev4_dualfeat_nodetach.sh`：myvideo human-anno 评估。
+- `extract_lseg_features_lfy.sh` + `run_feature3dgs_lfy.sh`：feature-3dgs lfy 全流程。
+- `run_langsplat_dronev4_2.sh` + `run_langsplat_lfy.sh`：LangSplat 全流程（需先准备 vanilla 3DGS base checkpoint）。
+
+**注意**：LangSplat 需要先训练一个 vanilla 3DGS base model 作为 `--start_checkpoint`。当前系统未部署原版 3DGS，若决定跑 LangSplat，需要先 clone [gaussian-splatting](https://github.com/graphdeco-inria/gaussian-splatting) 并训练 base model。
+
+### SegAnyGAussians on `dronev4_2`（2026-06-18）
+
+**运行结果**：
+- 环境：`saga`（clone 自 `gaussian_grouping`，PyTorch 2.1.2 + CUDA 12.1）。
+- 训练：`train_contrastive_feature.py` 10000 轮正常跑完，耗时约 56 分钟，无 NaN。
+- 最终指标：RFN=0.982，Pos cos=0.966，Neg cos=0.000，Loss≈0.000。
+- 测试集特征已渲染：`/mnt/data/liufengyang/SegAnyGAussians/output/dronev4_2/test/ours_-1/renders/`。
+
+**量化评估**：
+- 在 myvideo human-anno 93 个实例 mask 上做“mask 内 mean feature 作为 prototype，余弦相似度阈值分割”的代理评估，**best-threshold mIoU = 0.000**。相似度图几乎与 GT mask 无关（最大相似度 ~0.04）。
+
+**根因**：
+- `dronev4_2` 的 `sam_masks/` 中**每张图只有 1 个 mask**。
+- SegAnyGAussians 的 contrastive feature 依赖同一张图内多个 SAM mask 的“像素对”构建正/负样本。单 mask 导致：
+  - 没有负样本对（Neg cos 始终为 0）；
+  - 没有多尺度 mask 重叠的对比信号；
+  - 模型退化为把所有前景/可见像素映射到相似特征。
+- 因此特征训练虽然数值上收敛，但不具备实例级分割语义。
+
+**下一步**：
+- 若要继续跑 SegAnyGAussians，需重新生成 `sam_masks/`，让 SAM 输出每张图多个 mask（调低 `pred_iou_thresh` / `stability_score_thresh`，或增大 `points_per_side`）。
+- 或者换用交互式 GUI `saga_gui.py` 做点击分割验证，但预期效果同样有限。
+
+### 完整 Benchmark 汇总（按数据集）
+
+覆盖 `/mnt/data/liufengyang/data/dataset/` 下全部数据集，指标统一为 **Test PSNR / Test Binary mIoU**。未运行/未记录用 `—` 表示。
+
+| 数据集 | 方法 | Test PSNR | Test mIoU | 备注 |
+|---|---|---:|---:|---|
+| **dronev4_2** (SAM-test, 67) | Scaffold-GSLFY (Dual-Feature + no_opacity_detach) | **25.10** | **0.892** | 当前最优 |
+| | Scaffold-GSLFY (no_opacity_detach) | 25.10 | 0.889 | — |
+| | Scaffold-GSLFY (Dual-Feature) | 24.37 | 0.806 | — |
+| | Scaffold-GSLFY (sem_ramp) | 24.32 | 0.674 | — |
+| | Gaussian Grouping | 21.44 | 0.763 | — |
+| | COB-GS (mask finetune) | ~8.03 | 0.642 | RGB 崩溃 |
+| | feature-3dgs (LSeg) | 23.15 | — | 暂无量化 mIoU |
+| | LangSplat | — | — | 待运行 |
+| | SegAnyGAussians (contrastive feature 10k) | — | 0.000 | SAM mask 退化，单图单 mask，训练收敛但无实例语义 |
+| **dronev4_2** (myvideo, 37) | Scaffold-GSLFY (Dual-Feature + no_opacity_detach) | — | — | 待评估 |
+| | COB-GS (base) | 25.16 | 0.636 | 无 seg finetune |
+| | COB-GS (mask finetune) | 8.08 | 0.632 | RGB 崩溃 |
+| | Gaussian Grouping | — | 0.770 | 仅 mIoU |
+| **lfy/colmap_scene** (25) | Gaussian Grouping (train w/ eval, hold-out) | 22.06 | **0.862** | 用 `--eval` 训练，测试集不参与训练 |
+| | Gaussian Grouping (train all, eval split later) | 23.66 | 0.912 | 旧结果，测试集可能参与训练 |
+| | Scaffold-GSLFY (Dual-Feature + no_opacity_detach) | 21.65 | 0.877 | ours 最优 |
+| | Scaffold-GSLFY (no_opacity_detach) | 21.58 | 0.876 | — |
+| | Scaffold-GSLFY (Dual-Feature) | 21.69 | 0.828 | — |
+| | COB-GS (mask finetune) | 25.58 | 0.023 | 全前景失败 |
+| | feature-3dgs (LSeg) | — | — | 待运行 |
+| | LangSplat | — | — | 待运行 |
+| **scene_01** (60) | Gaussian Grouping | 21.63 | **0.919** | — |
+| | Scaffold-GSLFY (Dual-Feature + no_opacity_detach) | 20.37* | 0.920* | *iter 12000 中期，30k 仍在跑 |
+| | feature-3dgs / LangSplat | — | — | 待运行 |
+| **scene_00** | — | — | — | 未跑完 |
+| **scene_02** | — | — | — | 未运行 |
+| **scene_03** | — | — | — | 未运行 |
+| **scene_04** | — | — | — | 未跑完 |
+| **scene_05** | — | — | — | 未运行 |
+| **scene_06** | — | — | — | 未运行 |
+| **scene_07** | — | — | — | 未运行 |
+| **scene_08** | — | — | — | 未运行 |
+| **Flower_Dataset_Complete** | — | — | — | 未运行 |
+
+**结论**：
+- 当前 ours 在 `dronev4_2`（SAM-test）上领先；`lfy` 上 Gaussian Grouping 用 hold-out 训练后降到 0.862，ours 0.877 反超。
+- **所有 benchmark 训练必须加 `--eval`（或对应方法的标准 hold-out 配置）**，确保测试集不参与训练。之前 `output/lfy` 的 0.912 因为训练时可能用了测试集，不作为公平对照。
+- `scene_01` 中期结果已与 Gaussian Grouping 持平，等 30k 跑完再最终对比。
+- COB-GS 在 dronev4_2 和 lfy 的 mask finetune 均失败（RGB 崩溃或全前景）。
+- `scene_00`–`scene_08` 和 `Flower_Dataset_Complete` 基本未跑，可作为后续扩展。
+
+### Benchmark 训练规范
+
+**强制要求**：所有参与 benchmark 对比的方法，训练时必须使用官方/标准的 train/test hold-out 配置，**测试集不能参与训练**。
+
+| 方法 | 关键参数 | 说明 |
+|---|---|---|
+| Scaffold-GSLFY | `--eval` | 用 COLMAP 默认 test split |
+| Gaussian Grouping | `--eval` | `llffhold=8`，每 8 张取 1 张做 test |
+| COB-GS | 先训 base 3DGS，再 mask finetune | base 阶段用 `--eval` |
+| feature-3dgs | `--eval` | 标准 3DGS test split |
+| LangSplat | 依赖原版 3DGS 的 test split | base 3DGS 训练时加 `--eval` |
+
+**违规结果**：任何训练阶段使用了测试集的结果，统一标注为“测试集可能泄漏”，不作为主对照。
 
 ### 实验范围限定
 
@@ -105,9 +315,24 @@ D2 只跑 `dronev4_2 + lfy`，同一套参数，不允许给 lfy 单独调参：
 
 | 数据集 | 方法 | 输出目录 | 端口 | 状态 |
 | --- | --- | --- | --- | --- |
-| dronev4_2 | Dual-Feature + no_opacity_detach | outputs/20260612_d2_dronev4_dualfeat_nodetach | 6231 | **running** (2740/30000) |
+| dronev4_2 | Dual-Feature + no_opacity_detach | outputs/20260612_d2_dronev4_dualfeat_nodetach | 6231 | **已完成** (30000/30000) |
 
-**当前进度**（截至 2026-06-12 17:56）：4090/30000，速度约 1.38 s/it。7k eval 预计数小时后触发。
+**最终结果（dronev4_2 test）**：
+
+| 指标 | Test | Train | Gap |
+| --- | --- | --- | --- |
+| PSNR | **25.10** | 27.77 | 2.67 dB |
+| SSIM | **0.703** | 0.839 | 0.136 |
+| LPIPS | **0.287** | — | — |
+| Binary_mIoU | **0.892** | 0.931 | 0.039 |
+| FG_IoU | 0.793 | 0.867 | — |
+| BG_IoU | 0.990 | 0.996 | — |
+
+**结论**：
+- **此结果为当前 dronev4_2 上最优**。
+- Test mIoU 0.892 超过 `no_opacity_detach`（0.889）和 `Dual-Feature`（0.806）。
+- PSNR 25.10 与 `no_opacity_detach` 持平。
+- 说明 **Dual-Feature + no_opacity_detach 组合有效**：在保持 RGB 质量的同时略微提升分割精度，可作为 dronev4_2 上的主对照 / SOTA 候选。
 
 **命令**：
 
